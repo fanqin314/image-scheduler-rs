@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能图像调度系统 - Rust 版</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0f1117;
+            color: #e4e6eb;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            width: 100%;
+        }
+        h1 {
+            font-weight: 300;
+            font-size: 2rem;
+            margin-bottom: 6px;
+            background: linear-gradient(135deg, #00d2ff, #7a5cff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle {
+            color: #888;
+            margin-bottom: 30px;
+            font-size: 0.9rem;
+        }
+        .upload-area {
+            border: 2px dashed #3a3f4a;
+            border-radius: 16px;
+            padding: 40px 20px;
+            text-align: center;
+            background: #1a1d27;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            margin-bottom: 30px;
+        }
+        .upload-area:hover, .upload-area.dragover {
+            border-color: #7a5cff;
+            background: #22263b;
+        }
+        .upload-area input[type="file"] { display: none; }
+        .upload-icon { font-size: 48px; margin-bottom: 10px; }
+        .upload-text { font-size: 1.1rem; color: #aaa; }
+        .upload-hint { font-size: 0.8rem; color: #666; margin-top: 8px; }
+        .result-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .card {
+            background: #1a1d27;
+            border-radius: 16px;
+            padding: 20px;
+            border: 1px solid #2a2e3a;
+        }
+        .card-title {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #888;
+            margin-bottom: 12px;
+        }
+        .images-row {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .images-row .img-box {
+            flex: 1;
+            min-width: 200px;
+            background: #0b0d12;
+            border-radius: 12px;
+            overflow: hidden;
+            text-align: center;
+        }
+        .images-row img {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        .img-label {
+            padding: 6px 0;
+            font-size: 0.75rem;
+            color: #666;
+            background: #13161f;
+        }
+        .feature-list {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+        .feature-item {
+            background: #13161f;
+            border-radius: 8px;
+            padding: 10px 14px;
+        }
+        .feature-name {
+            font-size: 0.7rem;
+            color: #888;
+            text-transform: uppercase;
+        }
+        .feature-value {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-top: 2px;
+        }
+        .progress-bar {
+            width: 100%;
+            height: 4px;
+            background: #2a2e3a;
+            border-radius: 4px;
+            margin-top: 6px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            border-radius: 4px;
+            background: linear-gradient(90deg, #7a5cff, #00d2ff);
+            transition: width 0.5s ease;
+        }
+        .decision-badge {
+            display: inline-block;
+            padding: 8px 24px;
+            border-radius: 40px;
+            font-weight: 700;
+            font-size: 1.4rem;
+            letter-spacing: 1px;
+            margin-top: 8px;
+        }
+        .badge-cloud { background: #dc3545; color: #fff; }
+        .badge-local { background: #0d6efd; color: #fff; }
+        .badge-drop { background: #495057; color: #fff; }
+        .score-display {
+            font-size: 2.5rem;
+            font-weight: 300;
+        }
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 40px;
+            color: #7a5cff;
+        }
+        .spinner {
+            border: 4px solid #2a2e3a;
+            border-top: 4px solid #7a5cff;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 12px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .hidden { display: none; }
+        @media (max-width: 768px) {
+            .result-grid { grid-template-columns: 1fr; }
+            .feature-list { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>🦀 智能图像调度系统 (Rust 版)</h1>
+    <div class="subtitle">极速特征提取 → 价值评估 → 算力分配决策</div>
+
+    <div class="upload-area" id="dropArea">
+        <div class="upload-icon">📤</div>
+        <div class="upload-text">点击上传 或 拖拽图片到此处</div>
+        <div class="upload-hint">支持 JPG, PNG, BMP, WebP (最大 16MB)</div>
+        <input type="file" id="fileInput" accept="image/*">
+    </div>
+
+    <div class="loading" id="loading">
+        <div class="spinner"></div>
+        <div>正在提取特征 & 评估中...</div>
+    </div>
+
+    <div id="resultPanel" class="hidden">
+        <div class="result-grid">
+            <div class="card">
+                <div class="card-title">📸 图片分析</div>
+                <div class="images-row">
+                    <div class="img-box">
+                        <img id="origImg" src="" alt="原图">
+                        <div class="img-label">原图</div>
+                    </div>
+                    <div class="img-box">
+                        <img id="visImg" src="" alt="标注图">
+                        <div class="img-label">特征标注 (绿框=峰值窗口, 黄线=下半区)</div>
+                    </div>
+                </div>
+                <div style="margin-top:12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap;">
+                    <div>
+                        <span style="color:#888;">调度决策：</span>
+                        <span id="decisionBadge" class="decision-badge">-</span>
+                    </div>
+                    <div>
+                        <span style="color:#888;">价值分：</span>
+                        <span id="scoreDisplay" class="score-display">-</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">📊 7维特征向量</div>
+                <div class="feature-list" id="featureList"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const dropArea = document.getElementById('dropArea');
+    const fileInput = document.getElementById('fileInput');
+    const resultPanel = document.getElementById('resultPanel');
+    const loading = document.getElementById('loading');
+
+    dropArea.addEventListener('click', () => fileInput.click());
+    dropArea.addEventListener('dragover', (e) => { e.preventDefault(); dropArea.classList.add('dragover'); });
+    dropArea.addEventListener('dragleave', () => dropArea.classList.remove('dragover'));
+    dropArea.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropArea.classList.remove('dragover');
+        if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', (e) => {
+        if (e.target.files.length) handleFile(e.target.files[0]);
+    });
+
+    function handleFile(file) {
+        resultPanel.classList.add('hidden');
+        loading.style.display = 'block';
+
+        const formData = new FormData();
+        formData.append('file', file);
+
+        fetch('/upload', {
+            method: 'POST',
+            body: formData
+        })
+            .then(res => res.json())
+            .then(data => {
+                loading.style.display = 'none';
+                if (data.error) {
+                    alert('❌ 错误: ' + data.error);
+                    return;
+                }
+                displayResult(data);
+            })
+            .catch(err => {
+                loading.style.display = 'none';
+                alert('❌ 请求失败: ' + err.message);
+            });
+    }
+
+    function displayResult(data) {
+        const f = data.features;
+        const ev = data.evaluation;
+
+        document.getElementById('origImg').src = 'data:image/jpeg;base64,' + data.original_image;
+        document.getElementById('visImg').src = 'data:image/jpeg;base64,' + data.visualized_image;
+
+        const badge = document.getElementById('decisionBadge');
+        const action = ev.action;
+        badge.textContent = action;
+        badge.className = 'decision-badge';
+        if (action === 'CLOUD') badge.classList.add('badge-cloud');
+        else if (action === 'LOCAL') badge.classList.add('badge-local');
+        else if (action === 'DROP') badge.classList.add('badge-drop');
+
+        document.getElementById('scoreDisplay').textContent = ev.score.toFixed(3);
+
+        const list = document.getElementById('featureList');
+        list.innerHTML = '';
+        const featureNames = {
+            'entropy': '香农熵',
+            'edge_ratio': '全局边缘占比',
+            'brightness': '亮度',
+            'local_peak': '局部峰值边缘',
+            'local_variance': '局部离散度',
+            'lower_advantage': '下半区优势比',
+            'motion': '帧间运动幅度'
+        };
+        const maxValues = {
+            'entropy': 8.0,
+            'edge_ratio': 1.0,
+            'brightness': 1.0,
+            'local_peak': 1.0,
+            'local_variance': 1.0,
+            'lower_advantage': 1.0,
+            'motion': 64.0
+        };
+        for (const [key, label] of Object.entries(featureNames)) {
+            const val = f[key];
+            let pct = Math.min(1.0, val / maxValues[key]);
+            if (key === 'local_variance') pct = Math.min(1.0, val / (val + 1));
+
+            const div = document.createElement('div');
+            div.className = 'feature-item';
+            div.innerHTML = `
+                <div class="feature-name">${label}</div>
+                <div class="feature-value">${val}</div>
+                <div class="progress-bar"><div class="progress-fill" style="width:${pct*100}%;"></div></div>
+            `;
+            list.appendChild(div);
+        }
+
+        resultPanel.classList.remove('hidden');
+        resultPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+</script>
+</body>
+</html>
