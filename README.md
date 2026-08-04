@@ -23,7 +23,24 @@
 
 ## 🚀 快速开始
 
-### 编译运行
+### 方式一：直接下载（推荐，无需编译）
+
+从 **[Releases](https://github.com/fanqin314/image-scheduler-rs/releases)** 下载两个文件：
+
+| 文件 | 用途 |
+| :--- | :--- |
+| `image-scheduler-rs.exe` | 本地后端服务（双击即运行，自动打开浏览器） |
+| `realtime-extension-vX.X.X.zip` | Chrome 实时分析插件（解压后加载） |
+
+**安装步骤：**
+
+1. 双击 `image-scheduler-rs.exe` 启动后端，浏览器自动打开 `http://127.0.0.1:5000`（保持它在后台运行）
+2. 解压插件 zip → `chrome://extensions` → 开启「开发者模式」→「加载已解压的扩展程序」→ 选择解压出的文件夹
+3. **可选（自动启停后端）**：双击插件目录里的 `install_native_host.bat` 注册 Native Host，之后插件可自动启动/停止后端，无需手动开 exe
+
+> 💡 插件原理：插件通过 `127.0.0.1:5000` 直连本地后端。后端 exe 启动后插件即可用；Native Host 只是"自动启停"的加分项，不注册也能用（手动开 exe 即可）。
+
+### 方式二：源码编译运行
 
 ```bash
 cargo build --release
