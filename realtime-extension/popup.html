@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { width: 440px; min-height: 480px; background: #0d1117; color: #c9d1d9; font-family: 'Segoe UI', sans-serif; font-size: 12px; }
+
+  /* ---- header ---- */
+  .header { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid #21262d; }
+  .header .left { display: flex; align-items: center; gap: 8px; }
+  .header .title { font-weight: 700; font-size: 14px; color: #00ff88; }
+  .mode-badge {
+    display: none; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+  }
+  .mode-badge.show { display: inline-block; }
+  .mode-badge.cloud { background: #00ff8822; color: #00ff88; }
+  .mode-badge.local { background: #ffcc0022; color: #ffcc00; }
+  .mode-badge.drop  { background: #ff666622; color: #ff6666; }
+  .header .popout {
+    display: none; padding: 3px 8px; font-size: 11px; font-weight: 600;
+    border: 1px solid #30363d; border-radius: 4px;
+    background: #161b22; color: #c9d1d9; cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  .header .popout:hover  { border-color: #00ff88; color: #00ff88; }
+  .header .popout.show   { display: inline-block; }
+
+  /* ---- start ---- */
+  .start-section { padding: 14px 12px; text-align: center; }
+  #btnStart {
+    width: 100%; padding: 10px; font-size: 14px; font-weight: 700;
+    border: none; border-radius: 8px; cursor: pointer;
+    background: #00ff88; color: #0d1117; transition: opacity 0.2s;
+  }
+  #btnStart:hover { opacity: 0.85; }
+  #btnStart.running { background: #ff6666; }
+  .hint { margin-top: 8px; font-size: 11px; color: #8b949e; }
+
+  /* ---- indicators ---- */
+  .indicators { display: none; grid-template-columns: 1fr 1fr 1fr; gap: 4px; padding: 8px 12px; }
+  .indicators.show { display: grid; }
+  .ind { background: #161b22; border-radius: 6px; padding: 6px 8px; }
+  .ind .label { font-size: 10px; color: #8b949e; margin-bottom: 2px; }
+  .ind .val { font-size: 18px; font-weight: 700; font-family: 'Courier New', monospace; }
+  .ind .bar-wrap { height: 4px; border-radius: 2px; margin-top: 3px; background: #21262d; overflow: hidden; }
+  .ind .bar { height: 100%; border-radius: 2px; transition: width 0.3s; }
+
+  /* ---- score gauge ---- */
+  .score-wrap { display: none; padding: 0 12px 4px; }
+  .score-wrap.show { display: block; }
+  .score-row { display: flex; align-items: center; gap: 8px; }
+  .score-label { font-size: 11px; color: #8b949e; white-space: nowrap; }
+  .score-bar-wrap { flex: 1; height: 8px; border-radius: 4px; background: #21262d; overflow: hidden; }
+  .score-bar { height: 100%; border-radius: 4px; transition: width 0.4s, background 0.4s; }
+  .score-val { font-size: 16px; font-weight: 700; font-family: 'Courier New', monospace; min-width: 52px; text-align: right; }
+
+  /* ---- chart ---- */
+  .chart-wrap { display: none; padding: 6px 12px 0; }
+  .chart-wrap.show { display: block; }
+  .chart-wrap .chart-title { font-size: 11px; color: #8b949e; margin-bottom: 2px; }
+  canvas { display: block; width: 100%; border-radius: 6px; background: #161b22; }
+
+  /* ---- stats ---- */
+  .stats { display: none; grid-template-columns: repeat(4, 1fr); gap: 4px; padding: 8px 12px; }
+  .stats.show { display: grid; }
+  .stat { text-align: center; background: #161b22; border-radius: 6px; padding: 6px 4px; }
+  .stat .n { font-size: 20px; font-weight: 700; font-family: 'Courier New', monospace; }
+  .stat .l { font-size: 9px; color: #8b949e; margin-bottom: 3px; }
+  .stat .pct-bar { height: 3px; border-radius: 2px; margin: 0 auto; max-width: 60px; transition: width 0.4s; }
+  .stat.cc .n { color: #00ff88; }   .stat.cc .pct-bar { background: #00ff88; }
+  .stat.ll .n { color: #ffcc00; }   .stat.ll .pct-bar { background: #ffcc00; }
+  .stat.dd .n { color: #ff6666; }   .stat.dd .pct-bar { background: #ff6666; }
+  .stat.ff .n { color: #58a6ff; }   .stat.ff .pct-bar { background: #58a6ff; }
+
+  /* ---- footer ---- */
+  .footer { padding: 4px 12px 8px; font-size: 10px; color: #484f58; text-align: center; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="left">
+    <span class="title">视频实时分析</span>
+    <span class="mode-badge" id="modeBadge"></span>
+  </div>
+  <button id="btnPopout" class="popout" title="弹出独立窗口（不自动关闭）">↗ 弹出</button>
+</div>
+
+<div class="start-section">
+  <button id="btnStart">开始分析</button>
+  <div class="hint" id="hint"></div>
+</div>
+
+<div class="indicators" id="indicators"></div>
+
+<div class="score-wrap" id="scoreWrap">
+  <div class="score-row">
+    <span class="score-label">综合评分</span>
+    <div class="score-bar-wrap"><div class="score-bar" id="scoreBar" style="width:0%"></div></div>
+    <span class="score-val" id="scoreVal">--</span>
+  </div>
+</div>
+
+<div class="chart-wrap" id="chartWrap">
+  <div class="chart-title">六维指标 + 决策带 + 趋势线（归一化）</div>
+  <canvas id="chart" height="200"></canvas>
+</div>
+
+<div class="stats" id="stats">
+  <div class="stat cc"><div class="l">CLOUD</div><div class="n" id="cntC">0</div><div class="pct-bar" style="width:0%"></div></div>
+  <div class="stat ll"><div class="l">LOCAL</div><div class="n" id="cntL">0</div><div class="pct-bar" style="width:0%"></div></div>
+  <div class="stat dd"><div class="l">DROP</div><div class="n" id="cntD">0</div><div class="pct-bar" style="width:0%"></div></div>
+  <div class="stat ff"><div class="l">FPS</div><div class="n" id="cntF">--</div><div class="pct-bar" style="width:0%"></div></div>
+</div>
+
+<div class="footer" id="footer">点击按钮开始</div>
+
+<script src="popup.js"></script>
+</body>
+</html>

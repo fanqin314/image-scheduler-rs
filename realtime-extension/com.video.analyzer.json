@@ -1,0 +1,9 @@
+{
+  "name": "com.video.analyzer",
+  "description": "Video Analyzer Native Host - 管理 Rust 后端服务",
+  "path": "C:\\Users\\29799\\Desktop\\image-scheduler-rs\\realtime-extension\\native_launcher.bat",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://ofjehhcfkeffhlahceameagmmacjobni/"
+  ]
+}

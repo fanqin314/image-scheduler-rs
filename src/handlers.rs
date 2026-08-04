@@ -3,16 +3,18 @@
 // 该模块将请求、特征提取、评估、可视化串联起来，返回 JSON 响应
 
 use axum::{
-    extract::Multipart,      // 解析 multipart/form-data 格式的文件上传
-    response::{Html, IntoResponse, Json}, // 响应类型：HTML、JSON 等
+    extract::Multipart,
+    response::{Html, IntoResponse, Json},
+    Json as AxumJson,
 };
 use base64::{engine::general_purpose::STANDARD, Engine}; // Base64 编码
 use image::imageops::FilterType; // 图像缩放算法（最近邻）
 use crate::{
-    evaluator,      // 价值评估模块
-    features,       // 特征提取模块
-    types::UploadResponse, // 统一响应结构
-    visualization,  // 可视化标注图生成模块
+    config,
+    evaluator,
+    features,
+    types::{AnalyzeFrameRequest, AnalyzeFrameResponse, EvaluationResponse, FeatureResponse, UploadResponse},
+    visualization,
 };
 use std::io::Cursor; // 内存中的读写指针，用于将图片编码为 JPEG
 
@@ -61,7 +63,7 @@ pub async fn upload(mut multipart: Multipart) -> impl IntoResponse {
         }
     };
 
-    // --- 4. 调用特征提取模块，计算 7 维特征 ---
+    // --- 4. 调用特征提取模块，计算 10 维特征 ---
     let feature_map = features::extract_features(&img);
 
     // --- 5. 调用价值评估模块，计算价值分和决策动作 ---
@@ -96,6 +98,10 @@ pub async fn upload(mut multipart: Multipart) -> impl IntoResponse {
             local_variance: feature_map["local_variance"],
             lower_advantage: feature_map["lower_advantage"],
             motion: feature_map["motion"],
+            // === 新增三个特征（现在从 feature_map 读取真实值） ===
+            contour_count: feature_map["contour_count"],
+            contour_area_variance: feature_map["contour_area_variance"],
+            color_richness: feature_map["color_richness"],
         },
         // 评估响应（分数 + 动作）
         evaluation,
@@ -106,5 +112,279 @@ pub async fn upload(mut multipart: Multipart) -> impl IntoResponse {
     };
 
     // --- 10. 将响应序列化为 JSON 并返回 ---
+    Json(serde_json::to_value(&response).unwrap())
+}
+
+/// 视频上传处理器
+/// 接收前端上传的视频文件，逐帧提取特征、评估决策，
+/// 返回每帧结果 + 摘要统计
+pub async fn upload_video(mut multipart: Multipart) -> impl IntoResponse {
+    // --- 1. 解析 multipart，提取视频文件 ---
+    let mut file_data = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("file") {
+            if let Ok(data) = field.bytes().await {
+                file_data = Some(data.to_vec());
+                break;
+            }
+        }
+    }
+
+    let bytes = match file_data {
+        Some(b) => b,
+        None => {
+            return Json(serde_json::json!({ "error": "未找到视频文件或读取失败" }));
+        }
+    };
+
+    // --- 2. 写入临时文件（ffmpeg 需要文件路径） ---
+    let temp_input = match tempfile::Builder::new()
+        .suffix(".mp4")
+        .tempfile()
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return Json(serde_json::json!({ "error": format!("创建临时文件失败: {}", e) }));
+        }
+    };
+
+    use std::io::Write;
+    {
+        let mut f = temp_input.as_file();
+        if let Err(e) = f.write_all(&bytes) {
+            return Json(serde_json::json!({ "error": format!("写入临时文件失败: {}", e) }));
+        }
+    }
+
+    let temp_path = temp_input.path().to_path_buf();
+
+    // --- 3. 调 video 模块解码视频 ---
+    let video_frames = match crate::video::decode_video(&temp_path) {
+        Ok(v) => v,
+        Err(e) => {
+            return Json(serde_json::json!({ "error": format!("视频解码失败: {}", e) }));
+        }
+    };
+
+    if video_frames.frames.is_empty() {
+        return Json(serde_json::json!({ "error": "视频未提取到任何帧" }));
+    }
+
+    // --- 4. 两阶段分析：轻量检测（串行）+ 关键帧完整分析（并行） ---
+    // 第一阶段用低分辨率缩略图快速筛出"值得分析的帧"（关键帧），
+    // 第二阶段只对关键帧做完整 10 维特征提取，且用 rayon 并行加速，
+    // 避免对每一帧都做完整分析导致耗时过长。
+    let n = video_frames.frames.len();
+
+    // Phase 1: 串行轻量检测，收集关键帧索引
+    let mut light_cache: Vec<(f64, f64, bool)> = Vec::with_capacity(n); // (brightness, motion, is_keyframe)
+    let mut prev_gray: Option<image::GrayImage> = None;
+    let mut last_brightness = 0.0;
+
+    for (i, (_, img)) in video_frames.frames.iter().enumerate() {
+        let small = image::imageops::resize(
+            &img.to_luma8(),
+            config::LIGHT_RES, config::LIGHT_RES,
+            image::imageops::FilterType::Nearest,
+        );
+        let total_px = (config::LIGHT_RES * config::LIGHT_RES) as f64;
+        let brightness = small.pixels().map(|p| p[0] as f64).sum::<f64>() / total_px / 255.0;
+        let motion = match &prev_gray {
+            Some(p) => {
+                let diff: u64 = p.pixels().zip(small.pixels())
+                    .map(|(a, b)| (a[0] as i32 - b[0] as i32).unsigned_abs() as u64)
+                    .sum();
+                diff as f64 / total_px
+            }
+            None => 0.0,
+        };
+        let is_kf = i == 0
+            || (i % config::FORCE_INTERVAL == 0)
+            || motion > config::MOTION_THRESHOLD
+            || (brightness - last_brightness).abs() > config::BRIGHTNESS_CHANGE;
+        if is_kf { last_brightness = brightness; }
+        light_cache.push((brightness, motion, is_kf));
+        prev_gray = Some(small);
+    }
+
+    // Phase 2: 并行处理关键帧
+    let kf_indices: Vec<usize> = light_cache.iter()
+        .enumerate()
+        .filter(|(_, (_, _, is_kf))| *is_kf)
+        .map(|(i, _)| i)
+        .collect();
+
+    use rayon::prelude::*;
+    let kf_results: Vec<(usize, FeatureResponse, EvaluationResponse)> = kf_indices
+        .par_iter()
+        .map(|&i| {
+            let (_timestamp, img) = &video_frames.frames[i];
+            let prev_luma = if i > 0 {
+                video_frames.frames[i - 1].1.to_luma8()
+            } else {
+                video_frames.frames[0].1.to_luma8()
+            };
+            let feature_map = crate::features::extract_features_with_motion(img, Some(&prev_luma));
+            let evaluation = crate::evaluator::evaluate(&feature_map);
+            let fr = FeatureResponse {
+                entropy: feature_map["entropy"],
+                edge_ratio: feature_map["edge_ratio"],
+                brightness: feature_map["brightness"],
+                local_peak: feature_map["local_peak"],
+                local_variance: feature_map["local_variance"],
+                lower_advantage: feature_map["lower_advantage"],
+                motion: feature_map["motion"],
+                contour_count: feature_map["contour_count"],
+                contour_area_variance: feature_map["contour_area_variance"],
+                color_richness: feature_map["color_richness"],
+            };
+            // 传回 frame index + 结果
+            (i, fr, evaluation)
+        })
+        .collect();
+
+    // 构建关键帧查询表
+    use std::collections::HashMap;
+    let kf_map: HashMap<usize, (FeatureResponse, EvaluationResponse)> = kf_results
+        .iter()
+        .map(|(i, fr, ev)| (*i, (fr.clone(), ev.clone())))
+        .collect();
+
+    // Phase 3: 组装最终结果
+    let mut results: Vec<crate::types::VideoFrameResult> = Vec::with_capacity(n);
+    let (mut total_score, mut cloud_count, mut local_count, mut drop_count) = (0.0, 0, 0, 0);
+    let (mut max_entropy, mut max_motion) = (0.0, 0.0);
+    let mut last_kf_res: Option<(FeatureResponse, EvaluationResponse)> = None;
+
+    for i in 0..n {
+        let (timestamp, _img) = &video_frames.frames[i];
+        let (brightness, motion, is_keyframe) = light_cache[i];
+
+        if is_keyframe {
+            let (fr, ev) = kf_map[&i].clone();
+            total_score += ev.score;
+            match ev.action.as_str() {
+                "CLOUD" => cloud_count += 1,
+                "LOCAL" => local_count += 1,
+                _ => drop_count += 1,
+            }
+            if fr.entropy > max_entropy { max_entropy = fr.entropy; }
+            if fr.motion > max_motion { max_motion = fr.motion; }
+            last_kf_res = Some((fr.clone(), ev.clone()));
+            results.push(crate::types::VideoFrameResult {
+                frame_index: i,
+                timestamp_secs: *timestamp,
+                is_keyframe: true,
+                features: fr,
+                evaluation: ev,
+            });
+        } else {
+            let (feat, eval) = last_kf_res.as_ref().unwrap().clone();
+            total_score += eval.score;
+            match eval.action.as_str() {
+                "CLOUD" => cloud_count += 1,
+                "LOCAL" => local_count += 1,
+                _ => drop_count += 1,
+            }
+            results.push(crate::types::VideoFrameResult {
+                frame_index: i,
+                timestamp_secs: *timestamp,
+                is_keyframe: false,
+                features: FeatureResponse { brightness, motion, ..feat },
+                evaluation: eval,
+            });
+        }
+    }
+
+    let n = results.len() as f64;
+    let summary = crate::types::VideoSummary {
+        cloud_count,
+        local_count,
+        drop_count,
+        avg_score: if n > 0.0 { total_score / n } else { 0.0 },
+        max_entropy,
+        max_motion,
+    };
+
+    let response = crate::types::VideoUploadResponse {
+        total_frames: results.len(),
+        fps: video_frames.fps,
+        duration_secs: video_frames.total_duration,
+        frames: results,
+        summary,
+    };
+
+    Json(serde_json::to_value(&response).unwrap())
+}
+
+/// 实时帧分析处理器（Chrome 扩展用）
+/// 接收当前帧 + 上一帧（可选），即时返回特征与评估
+pub async fn analyze_frame(
+    AxumJson(payload): AxumJson<AnalyzeFrameRequest>,
+) -> impl IntoResponse {
+    // --- 辅助：从 base64 解码为 DynamicImage ---
+    fn decode_base64_image(b64: &str) -> Result<image::DynamicImage, String> {
+        let b64 = if b64.contains("base64,") {
+            b64.split("base64,").nth(1).unwrap_or(b64)
+        } else {
+            b64
+        };
+        let bytes = STANDARD.decode(b64).map_err(|e| format!("Base64 解码失败: {}", e))?;
+        image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {}", e))
+    }
+
+    // --- 1. 解码当前帧 ---
+    let cur_img = match decode_base64_image(&payload.image_base64) {
+        Ok(img) => img,
+        Err(e) => return Json(serde_json::json!({ "error": e })),
+    };
+
+    // --- 2. 解码上一帧（如果有），提取灰度图 ---
+    let prev_gray = match &payload.prev_image_base64 {
+        Some(b64) => match decode_base64_image(b64) {
+            Ok(prev) => {
+                let prev_small = image::imageops::resize(
+                    &prev.to_luma8(),
+                    config::THUMBNAIL_SIZE,
+                    config::THUMBNAIL_SIZE,
+                    FilterType::Nearest,
+                );
+                Some(prev_small)
+            }
+            Err(_) => None,
+        },
+        None => None,
+    };
+
+    // --- 3. 特征提取 ---
+    let feature_map = features::extract_features_with_motion(
+        &cur_img,
+        prev_gray.as_ref(),
+    );
+
+    // --- 4. 评估 ---
+    let evaluation = evaluator::evaluate(&feature_map);
+
+    // --- 5. 组装响应 ---
+    let response = AnalyzeFrameResponse {
+        features: FeatureResponse {
+            entropy: feature_map["entropy"],
+            edge_ratio: feature_map["edge_ratio"],
+            brightness: feature_map["brightness"],
+            local_peak: feature_map["local_peak"],
+            local_variance: feature_map["local_variance"],
+            lower_advantage: feature_map["lower_advantage"],
+            motion: feature_map["motion"],
+            contour_count: feature_map["contour_count"],
+            contour_area_variance: feature_map["contour_area_variance"],
+            color_richness: feature_map["color_richness"],
+        },
+        evaluation: EvaluationResponse {
+            score: evaluation.score,
+            action: evaluation.action,
+        },
+    };
+
     Json(serde_json::to_value(&response).unwrap())
 }

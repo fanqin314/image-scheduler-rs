@@ -1,1 +1,11 @@
+# Rust 构建产物
 /target
+
+# 编译出的 EXE（源码库不提交构建产物，发布时用 GitHub Release）
+/image-scheduler-rs.exe
+
+# IDE 配置
+/.idea/
+
+# AI 工作记忆（不入库）
+/.workbuddy/

@@ -2,16 +2,19 @@
 // 模块声明
 // 告诉 Rust 编译器这些模块在 src/ 目录下的对应文件中
 // ============================================================
-mod types;          // 公共数据结构（FeatureResponse, EvaluationResponse 等）
-mod features;       // 特征提取核心（熵、Sobel、滑动窗口）
+mod config;         // 全局可调参数中心（特征/权重/阈值/采样）
+mod types;          // 公共数据结构
+mod features;       // 特征提取核心（熵、Sobel、滑动窗口、轮廓）
 mod evaluator;      // 价值评估（打分 + 决策）
 mod visualization;  // 可视化标注图生成（绿框、黄线）
 mod handlers;       // Web 路由处理器（首页 / 上传接口）
+mod video;          // 视频解码（ffmpeg 逐帧提取）
 
 // ============================================================
 // 外部依赖导入
 // ============================================================
 use axum::{
+    extract::DefaultBodyLimit,  // 请求体大小限制配置
     routing::{get, post},  // get: 处理 GET 请求, post: 处理 POST 请求
     Router,                // 路由构建器，把 URL 路径和处理器函数绑定
 };
@@ -19,13 +22,25 @@ use tower_http::trace::TraceLayer;  // 日志中间件，自动打印请求日�
 
 // ============================================================
 // 主函数入口
-// #[tokio::main] 是 tokio 运行时宏，将 async main 转换为同步入口，
-// 并启动一个多线程异步运行时。
+// 先同步执行 ffmpeg 下载（避免 reqwest::blocking 与 tokio 运行时冲突），
+// 再进入 tokio 异步运行时启动 HTTP 服务。
 // ============================================================
-#[tokio::main]
-async fn main() {
+fn main() {
+    println!("\u{1f980} 启动 Rust 图像调度服务...");
+    if let Err(e) = crate::video::ensure_ffmpeg() {
+        eprintln!("ffmpeg 初始化失败: {}，视频功能将不可用", e);
+    }
+    // 使用当前线程运行时，避免多线程运行时与 reqwest::blocking 的兼容问题
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async_main());
+}
+
+async fn async_main() {
+
     // ---------- 1. 打印启动信息 ----------
-    println!("🦀 启动 Rust 图像调度服务...");
 
     // ---------- 2. 构建路由 ----------
     // Router::new() 创建一个空路由
@@ -40,6 +55,9 @@ async fn main() {
     let app = Router::new()
         .route("/", get(handlers::index))
         .route("/upload", post(handlers::upload))
+        .route("/upload-video", post(handlers::upload_video))
+        .route("/analyze-frame", post(handlers::analyze_frame))
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))  // 256MB，匹配前端提示
         .layer(TraceLayer::new_for_http());
 
     // ---------- 3. 绑定 TCP 端口 ----------

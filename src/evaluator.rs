@@ -1,97 +1,128 @@
 //! 价值评估模块
 //!
-//! 本模块负责根据特征提取器生成的7维特征向量，
+//! 本模块负责根据特征提取器生成的特征向量，
 //! 计算图片的"价值分数"，并做出算力分配决策。
 //! 决策结果决定该图片应由本地处理、云端处理、还是直接丢弃。
 
+use crate::config;
 use crate::types::{EvaluationResponse, FeatureMap};
 
 /// 评估特征，返回价值分和决策动作
 ///
 /// # 参数
-/// - `features`: 特征图，包含7个键值对：
-///   - `entropy`: 香农熵 (0~8)，衡量灰度分布随机性
-///   - `edge_ratio`: 全局边缘占比 (0~1)，衡量画面内容丰富度
-///   - `brightness`: 平均亮度 (0~1)，用于判断过曝/欠曝
-///   - `local_peak`: 局部峰值边缘 (0~1)，捕捉画面中最密集的细节区域
-///   - `local_variance`: 局部离散度，衡量内容分布的均匀程度
-///   - `lower_advantage`: 下半区优势比，车行场景专用（路面/车辆 vs 天空）
-///   - `motion`: 帧间运动幅度，衡量动态风险
+/// - `features`: 特征图，包含 10 个键值对：
+///   - `entropy`: 香农熵 (0~8)
+///   - `edge_ratio`: 全局边缘占比 (0~1)
+///   - `brightness`: 平均亮度 (0~1) —— 用作惩罚项，不参与权重
+///   - `local_peak`: 局部峰值边缘 (0~1)
+///   - `lower_advantage`: 下半区优势比
+///   - `motion`: 帧间运动幅度
+///   - `contour_count`: 轮廓数量
+///   - `contour_area_variance`: 轮廓面积方差
+///   - `color_richness`: 颜色丰富度 (0~1)
 ///
 /// # 返回值
 /// 返回 `EvaluationResponse`，包含：
-/// - `score`: 0~1 之间的价值分数，越高表示越值得投入更多算力
-/// - `action`: 决策动作，取值为 `"CLOUD"`、`"LOCAL"`、`"DROP"`
+/// - `score`: 0~1 之间的价值分数
+/// - `action`: `"CLOUD"` | `"LOCAL"` | `"DROP"`
 ///
-/// # 决策阈值
-/// - `score >= 0.7` → `CLOUD`（送云端GPU）
-/// - `0.4 <= score < 0.7` → `LOCAL`（本地处理）
-/// - `score < 0.4` → `DROP`（直接丢弃）
+/// # 决策阈值（详见 config.rs）
+/// - `score >= THRESHOLD_CLOUD (0.72)` → `CLOUD`
+/// - `THRESHOLD_LOCAL (0.38) <= score < 0.72` → `LOCAL`
+/// - `score < 0.38` → `DROP`
+///
+/// # 设计原则
+/// 权重总和恒为 1.0，全部可调参数集中在 config.rs：
+///   - local_peak: 最高权重，因为"局部有主体"是最关键的信号
+///   - contour_count: 次高，轮廓数量直接反映场景复杂度
+///   - color_richness: 颜色丰富说明场景复杂
+///   - lower_advantage: 车行场景特化
+///   - motion: 风险触发器，留位置给视频流
+///   - entropy: 基础筛选用
+///   - contour_area_variance: 辅助判断物体大小是否多样
 pub fn evaluate(features: &FeatureMap) -> EvaluationResponse {
-    // ========== 第一步：定义各特征的权重 ==========
-    // 权重总和 = 1.0，反映各特征对最终决策的贡献度
-    // 这些权重可根据业务场景调优，例如：
-    // - 车行场景可适当提高 local_peak 和 lower_advantage 的权重
-    // - 通用场景可均衡分配
-
-    let w_edge = 0.25;       // 全局边缘占比权重
-    let w_peak = 0.30;       // 局部峰值边缘权重（最高）
-    let w_var = 0.15;        // 局部离散度权重
-    let w_lower = 0.20;      // 下半区优势比权重
-    let w_motion = 0.10;     // 运动幅度权重
+    // ========== 第一步：读取权重（定义于 config.rs） ==========
+    let w_saliency = config::W_SALIENCY;
+    let w_local_peak = config::W_LOCAL_PEAK;
+    let w_contour_count = config::W_CONTOUR_COUNT;
+    let w_color_richness = config::W_COLOR_RICHNESS;
+    let w_edge_ratio = config::W_EDGE_RATIO;
+    let w_lower_advantage = config::W_LOWER_ADVANTAGE;
+    let w_contour_area_var = config::W_CONTOUR_AREA_VAR;
+    let w_entropy = config::W_ENTROPY;
+    let w_motion = config::W_MOTION;
 
     // ========== 第二步：读取特征值 ==========
-    // 从特征图中提取各维度的具体数值
-    let edge_ratio = features["edge_ratio"];
     let local_peak = features["local_peak"];
-    let local_variance = features["local_variance"];
+    let edge_ratio = features["edge_ratio"];
     let lower_advantage = features["lower_advantage"];
     let motion = features["motion"];
+    let entropy = features["entropy"];
 
-    // ========== 第三步：计算基础分数 ==========
-    // 加权求和公式：
-    // score = w_edge * edge_ratio
-    //       + w_peak * local_peak
-    //       + w_var * (local_variance / (local_variance + 1))   ← 归一化到 0~1
-    //       + w_lower * (lower_advantage / (lower_advantage + 1)) ← 归一化到 0~1
-    //       + w_motion * (motion / 64)                          ← 归一化到 0~1
-    //
-    // 为什么要归一化？
-    // - local_variance 理论上可无限大，用 x/(x+1) 映射到 (0,1)
-    // - lower_advantage 同理，避免极端值主导分数
-    // - motion 除以 64 做归一化（假设最大运动幅度为64像素/帧）
-    let mut score = w_edge * edge_ratio
-        + w_peak * local_peak
-        + w_var * (local_variance / (local_variance + 1.0))
-        + w_lower * (lower_advantage / (lower_advantage + 1.0))
-        + w_motion * (motion / 64.0);
+    // 新增特征
+    let contour_count = features["contour_count"];
+    let contour_area_variance = features["contour_area_variance"];
+    let color_richness = features["color_richness"];
 
-    // ========== 第四步：应用亮度惩罚 ==========
-    // 如果图片过暗（亮度 < 0.15）或过曝（亮度 > 0.92），
-    // 说明图像质量差，无法提取有效信息，价值应大幅降低
-    // 这里直接乘以 0.3 的惩罚系数
+    // ========== 第三步：归一化 ==========
+    // 主体-背景对比度：local_peak / (edge_ratio + 0.05)，上限 SALIENCY_MAX
+    // 0.05 为平滑项，防止 edge_ratio 为 0 时除零
+    let saliency_raw = local_peak / (edge_ratio + 0.05);
+    let saliency = (saliency_raw / config::SALIENCY_MAX).min(1.0);
+
+    // 轮廓数量：上限 CONTOUR_COUNT_MAX（该值以下已非常密集）
+    let contour_count_norm = (contour_count / config::CONTOUR_COUNT_MAX).min(1.0);
+
+    // 轮廓面积方差：用 x/(x+1) 压缩到 (0,1)
+    let contour_area_var_norm = contour_area_variance / (contour_area_variance + 1.0);
+
+    // 熵：除以 ENTROPY_MAX (8) 映射到 (0,1)
+    let entropy_norm = entropy / config::ENTROPY_MAX;
+
+    // 下半区优势：用 x/(x+1) 压缩到 (0,1)
+    let lower_advantage_norm = lower_advantage / (lower_advantage + 1.0);
+
+    // 运动：除以 MOTION_DIVISOR 映射到 (0,1)
+    let motion_norm = (motion / config::MOTION_DIVISOR).min(1.0);
+
+    // ========== 第四步：计算基础分数 ==========
+    let mut score =
+        w_saliency * saliency +
+            w_local_peak * local_peak +
+            w_contour_count * contour_count_norm +
+            w_color_richness * color_richness +
+            w_edge_ratio * edge_ratio +
+            w_lower_advantage * lower_advantage_norm +
+            w_contour_area_var * contour_area_var_norm +
+            w_entropy * entropy_norm +
+            w_motion * motion_norm;
+
+    // ========== 第五步：应用亮度惩罚（分段线性） ==========
+    // brightness 不参与权重，只做惩罚。用分段线性替代一刀切，
+    // 保留过渡区间，避免夜间车灯/隧道出口等临界场景被误杀。
     let brightness = features["brightness"];
-    if brightness < 0.15 || brightness > 0.92 {
-        score *= 0.3;  // 亮度惩罚：价值打三折
-    }
+    let brightness_penalty = if brightness < config::BRIGHTNESS_DARK {
+        // 极暗：亮度 0→0.2 线性升至 BRIGHTNESS_DARK(0.10)→0.7
+        (brightness / config::BRIGHTNESS_DARK) * 0.5 + 0.2
+    } else if brightness > config::BRIGHTNESS_OVER {
+        // 过曝：亮度 BRIGHTNESS_OVER(0.95)→0.7 线性降至 1.0→0.2
+        ((1.0 - brightness) / (1.0 - config::BRIGHTNESS_OVER)) * 0.5 + 0.2
+    } else {
+        1.0  // 正常区间无惩罚
+    };
+    score *= brightness_penalty;
 
-    // ========== 第五步：裁剪分数到 [0, 1] 区间 ==========
-    // 防止浮点误差导致分数超出范围
+    // ========== 第六步：裁剪分数到 [0, 1] ==========
     let score = score.min(1.0).max(0.0);
 
-    // ========== 第六步：根据分数做出决策 ==========
-    // 决策阈值定义了"高价值"和"低价值"的分界线
-    // - score >= 0.7：画面内容复杂或有风险，需要云端最强算力
-    // - 0.4 <= score < 0.7：内容适中，本地算力可应对
-    // - score < 0.4：低价值画面（纯色背景、模糊、噪点），直接丢弃以节省资源
-    let action = if score >= 0.7 {
+    // ========== 第七步：做出决策（阈值定义于 config.rs，微调可减少边界抖动） ==========
+    let action = if score >= config::THRESHOLD_CLOUD {
         "CLOUD".to_string()
-    } else if score >= 0.4 {
+    } else if score >= config::THRESHOLD_LOCAL {
         "LOCAL".to_string()
     } else {
         "DROP".to_string()
     };
 
-    // ========== 第七步：返回评估结果 ==========
     EvaluationResponse { score, action }
 }

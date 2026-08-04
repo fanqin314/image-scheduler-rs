@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Video Realtime Analyzer",
+  "version": "0.2.0",
+  "description": "通用视频实时画面分析，支持任意网站",
+  "permissions": ["tabs", "scripting", "nativeMessaging", "downloads"],
+  "host_permissions": [
+    "http://127.0.0.1:5000/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "视频实时分析"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["shadow-hook.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
+  ]
+}
