@@ -264,7 +264,8 @@ pub async fn upload_video(mut multipart: Multipart) -> impl IntoResponse {
 
         if is_keyframe {
             let (fr, mut ev) = kf_map[&i].clone();
-            // 滞后：上一帧 CLOUD 且当前分接近阈值 → 保持 CLOUD
+            // 滞后防抖（在此做而非并行求值中，因 rayon 无序无法传 prev_action）
+            // 效果：消除相邻帧评分 0.001 波动导致的 CLOUD↔LOCAL 决策翻转
             if let Some(ref prev) = prev_action {
                 if prev == "CLOUD" && ev.action != "CLOUD" && ev.score >= config::THRESHOLD_CLOUD - config::HYSTERESIS {
                     ev.action = "CLOUD".to_string();

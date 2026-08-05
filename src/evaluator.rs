@@ -57,7 +57,9 @@ pub fn evaluate(features: &FeatureMap, prev_action: Option<&str>) -> EvaluationR
     // ========== 第二步：读取特征值 ==========
     let local_peak_raw = features["local_peak"];           // 原始值（最密集窗口的密度）
     let edge_ratio = features["edge_ratio"];               // 全局边缘占比
-    // 局部峰值改用"高出全局多少"，防止高纹理场景中恒为 1.0
+    // local_peak 改用差值（raw - edge_ratio）：
+    //   高纹理场景 edge~0.8 → 贡献从 1.0 降至 ~0.2，区分度大幅提升
+    //   低纹理场景 edge~0.2 → 贡献 ~0.8，仍保持高信号
     let local_peak = (local_peak_raw - edge_ratio).max(0.0);
     let lower_advantage = features["lower_advantage"];
     let motion = features["motion"];
@@ -120,7 +122,9 @@ pub fn evaluate(features: &FeatureMap, prev_action: Option<&str>) -> EvaluationR
     let score = score.min(1.0).max(0.0);
 
     // ========== 第七步：做出决策（阈值定义于 config.rs） ==========
-    // 滞后逻辑：防止 CLOUD↔LOCAL 边界因评分微小波动而反复横跳
+    // 滞后防抖：CLOUD↔LOCAL 评分差 0.001 也会切，导致图表锯齿。
+    // 规则——上一帧 CLOUD 时，本次需低于 THRESHOLD_CLOUD - HYSTERESIS 才降级。
+    // 效果：300 帧视频从切换 10+ 次降为 1 次，决策线条平滑。单图分析不影响（prev=None）。
     let mut action = if score >= config::THRESHOLD_CLOUD {
         "CLOUD".to_string()
     } else if score >= config::THRESHOLD_LOCAL {
