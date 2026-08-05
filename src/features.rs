@@ -230,19 +230,21 @@ pub fn sliding_window_features(edge_map: &GrayImage, win_size: u32, step: u32) -
 /// | color_richness | 0~1 | HSV 色相覆盖广度 (颜色多样性) |
 ///
 /// 单图特征提取入口（向后兼容）：motion 固定为 0.0。
-pub fn extract_features(img: &DynamicImage) -> FeatureMap {
-    extract_features_with_motion(img, None)
+pub fn extract_features(img: &DynamicImage, region: config::HalfRegion) -> FeatureMap {
+    extract_features_with_motion(img, None, region)
 }
 
-/// 完整特征提取，支持帧间 motion 计算
+/// 完整特征提取，支持帧间 motion 计算和用户指定的关注区间
 ///
 /// # 参数
 /// - `img`: 当前帧图像
 /// - `prev_gray`: 上一帧的灰度图（THUMBNAIL_SIZE x THUMBNAIL_SIZE），用于计算 motion。
 ///   单图模式传 `None`，motion 固定为 0.0。
+/// - `region`: 关注的半区方向（下半区/上半区/左半区/右半区），由 /set-region 切换。
 pub fn extract_features_with_motion(
     img: &DynamicImage,
     prev_gray: Option<&GrayImage>,
+    region: config::HalfRegion,
 ) -> FeatureMap {
     // ===== 第 1 步：预处理 =====
     // 转灰度 (丢弃颜色信息，只保留亮度)
@@ -263,8 +265,10 @@ pub fn extract_features_with_motion(
     // 特征 1: 香农熵
     let entropy = shannon_entropy(&small);
 
-    // 特征 2 & 3: 边缘占比 (Sobel 检测)
-    let (edge_map, edge_ratio) = sobel_edge_detection(&small, config::SOBEL_THRESHOLD);
+    // 特征 2 & 3: 边缘占比（Sobel 检测，自适应阈值防亮画面边缘泛滥）
+    let avg_brightness: f64 = small.pixels().map(|p| p[0] as f64).sum::<f64>() / (n * n) as f64;
+    let edge_thresh = ((config::SOBEL_THRESHOLD_BASE as f64) + avg_brightness * 0.3).clamp(20.0, 80.0) as u8;
+    let (edge_map, edge_ratio) = sobel_edge_detection(&small, edge_thresh);
 
     // 特征 4: 平均亮度 (归一化到 0~1)
     let total_px = (n * n) as f64;
@@ -279,24 +283,26 @@ pub fn extract_features_with_motion(
     let (local_peak, local_variance) =
         sliding_window_features(&edge_map, config::WINDOW_SIZE, config::WINDOW_STEP);
 
-    // 特征 7: 下半区优势比 (车行场景专用)
-    // 下半区 (y >= LOWER_HALF_OFFSET) vs 上半区 (y < LOWER_HALF_OFFSET)
+    // 特征 7: 半区优势比（根据 region 参数动态选择关注方向）
+    // 统计"关注区"的边缘密度 vs "非关注区"的边缘密度
     let half = config::LOWER_HALF_OFFSET;
-    let mut upper = 0u64;
-    let mut lower = 0u64;
+    let mut region_a = 0u64;  // 关注区边缘像素数
+    let mut region_b = 0u64;  // 非关注区边缘像素数
     for y in 0..n {
         for x in 0..n {
             if edge_map.get_pixel(x, y)[0] > 0 {
-                if y < half {
-                    upper += 1;
-                } else {
-                    lower += 1;
-                }
+                let in_a = match region {
+                    config::HalfRegion::Lower => y >= half,
+                    config::HalfRegion::Upper => y < half,
+                    config::HalfRegion::Left  => x < half,
+                    config::HalfRegion::Right => x >= half,
+                };
+                if in_a { region_a += 1; } else { region_b += 1; }
             }
         }
     }
-    // +1 防止除零 (如果上半区完全没有边缘)
-    let lower_advantage = lower as f64 / (upper as f64 + 1.0);
+    // +1 防止除零
+    let lower_advantage = region_a as f64 / (region_b as f64 + 1.0);
 
     // 特征 8: 帧间运动幅度
     let motion = match prev_gray {
@@ -314,7 +320,7 @@ pub fn extract_features_with_motion(
 
     // ===== 特征 9: 轮廓统计 =====
     // 用轮廓数量 + 面积方差刻画"场景里有几个物体、大小是否悬殊"
-    let (contour_count, _contour_area_mean, contour_area_variance) = extract_contour_stats(&edge_map);
+    let (contour_count, _contour_area_mean, contour_area_variance) = extract_contour_stats(&small);
 
     // ===== 特征 10: 颜色丰富度 =====
     // 注意：这里传入的是原始图像 img，不是缩略图 small（颜色特征需要 RGB 信息）
@@ -358,7 +364,10 @@ pub fn get_edge_map(img: &DynamicImage) -> GrayImage {
         n,
         image::imageops::FilterType::Nearest,
     );
-    let (edge_map, _) = sobel_edge_detection(&small, config::SOBEL_THRESHOLD);
+    // 自适应阈值：亮度越高边缘越密集→提高阈值避免全图白
+    let avg_brightness: f64 = small.pixels().map(|p| p[0] as f64).sum::<f64>() / (n * n) as f64;
+    let dyn_thresh = ((config::SOBEL_THRESHOLD_BASE as f64) + avg_brightness * 0.3).clamp(20.0, 80.0) as u8;
+    let (edge_map, _) = sobel_edge_detection(&small, dyn_thresh);
     edge_map
 }
 
@@ -366,66 +375,124 @@ pub fn get_edge_map(img: &DynamicImage) -> GrayImage {
 // 轮廓统计与颜色丰富度（特征 9、10 的计算函数）
 // ============================================================
 
-/// 提取轮廓统计（浅层：连通域分析）
-///
-/// 在 Sobel 边缘图上做二值化 → 连通域标记，返回三个指标：
-/// - `轮廓数量`：(usize) 独立连通域个数，反映画面中"物体"的多少
-/// - `面积均值`：(f64) 轮廓的平均像素数，反映物体大小的平均水平
-/// - `面积方差`：(f64) 轮廓面积的方差，大=物体大小差异大（前景/背景分明），小=均匀纹理
-pub fn extract_contour_stats(edge_map: &GrayImage) -> (usize, f64, f64) {
-    // 1. 将边缘图转为二值图（0 或 255）
-    let (w, h) = edge_map.dimensions();
+/// Otsu 自动阈值：在灰度直方图上最小化类内方差，返回最佳分割阈值。
+fn otsu_threshold(gray: &GrayImage) -> u8 {
+    let mut hist = [0u64; 256];
+    for p in gray.pixels() { hist[p[0] as usize] += 1; }
+    let total = (gray.width() * gray.height()) as f64;
+    let mut sum_all = 0u64;
+    for i in 0..256 { sum_all += i as u64 * hist[i]; }
+
+    let (mut w0, mut sum0) = (0u64, 0u64);
+    let mut best_thresh = 128u8;
+    let mut best_between = 0.0f64;
+
+    for t in 1..255 {
+        w0 += hist[t];
+        if w0 == 0 { continue; }
+        sum0 += t as u64 * hist[t];
+        let w1 = total as u64 - w0;
+        if w1 == 0 { break; }
+        let sum1 = sum_all - sum0;
+        let m0 = sum0 as f64 / w0 as f64;
+        let m1 = sum1 as f64 / w1 as f64;
+        let between = w0 as f64 * w1 as f64 * (m0 - m1) * (m0 - m1);
+        if between > best_between {
+            best_between = between;
+            best_thresh = t as u8;
+        }
+    }
+    best_thresh
+}
+
+/// 在灰度图上做 Otsu 二值化 + 开运算去噪，返回干净的分割二值图。
+/// 同时被 visualization.rs 调用来画物体轮廓。
+pub fn segment_foreground(gray: &GrayImage) -> GrayImage {
+    let (w, h) = gray.dimensions();
+    let t = otsu_threshold(gray);
     let mut binary = GrayImage::new(w, h);
     for y in 0..h {
         for x in 0..w {
-            let v = edge_map.get_pixel(x, y)[0];
-            binary.put_pixel(x, y, Luma([if v > 0 { 255u8 } else { 0u8 }]));
+            let v = gray.get_pixel(x, y)[0];
+            binary.put_pixel(x, y, Luma([if v > t { 255u8 } else { 0u8 }]));
         }
     }
-
-    // 2. 提取轮廓
-    use imageproc::contours::find_contours;
-
-    let contours = find_contours(&binary);
-    let count = contours.len();
-
-    if count == 0 {
-        return (0, 0.0, 0.0);
-    }
-
-    // 3. 计算每个轮廓的面积（用边界框面积近似）
-    let total_pixels = (w * h) as f64;
-    let mut areas: Vec<f64> = Vec::new();
-
-    for contour in &contours {
-        // 修正点1：使用 contour.points.is_empty()
-        if contour.points.is_empty() {
-            continue;
-        }
-        // 修正点2：使用 contour.points.iter()，Point 有 x 和 y 字段
-        let min_x = contour.points.iter().map(|p| p.x).min().unwrap_or(0);
-        let max_x = contour.points.iter().map(|p| p.x).max().unwrap_or(0);
-        let min_y = contour.points.iter().map(|p| p.y).min().unwrap_or(0);
-        let max_y = contour.points.iter().map(|p| p.y).max().unwrap_or(0);
-        let bbox_area = ((max_x - min_x + 1) * (max_y - min_y + 1)) as f64;
-        areas.push(bbox_area / total_pixels);
-    }
-
-    // 如果所有轮廓都被跳过了（理论上不会发生），返回 0
-    if areas.is_empty() {
-        return (0, 0.0, 0.0);
-    }
-
-    let area_mean = areas.iter().sum::<f64>() / areas.len() as f64;
-    let area_var = areas.iter()
-        .map(|a| (a - area_mean).powi(2))
-        .sum::<f64>() / areas.len() as f64;
-
-    (count, area_mean, area_var)
+    // 开运算：先腐蚀再膨胀，去除椒盐噪点
+    let opened = perform_opening(&binary, 2);
+    opened
 }
 
-/// 计算颜色丰富度（HSV 色相覆盖广度）
-/// 将色相 0~360° 分成 config::HUE_BINS 个 bin，统计覆盖了多少个 bin
+/// 简单开运算（腐蚀 → 膨胀）
+fn perform_opening(img: &GrayImage, radius: u32) -> GrayImage {
+    let (w, h) = img.dimensions();
+    let eroded = erode(img, radius);
+    dilate(&eroded, radius)
+}
+fn erode(img: &GrayImage, r: u32) -> GrayImage {
+    let (w, h) = img.dimensions();
+    let mut out = GrayImage::new(w, h);
+    for y in r..(h - r) {
+        for x in r..(w - r) {
+            let mut all = true;
+            'outer: for dy in -(r as i32)..=(r as i32) {
+                for dx in -(r as i32)..=(r as i32) {
+                    if img.get_pixel((x as i32 + dx) as u32, (y as i32 + dy) as u32)[0] == 0 {
+                        all = false; break 'outer;
+                    }
+                }
+            }
+            out.put_pixel(x, y, Luma([if all { 255u8 } else { 0u8 }]));
+        }
+    }
+    out
+}
+fn dilate(img: &GrayImage, r: u32) -> GrayImage {
+    let (w, h) = img.dimensions();
+    let mut out = GrayImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let mut any = false;
+            'outer: for dy in -(r as i32)..=(r as i32) {
+                for dx in -(r as i32)..=(r as i32) {
+                    let nx = (x as i32 + dx).max(0).min(w as i32 - 1) as u32;
+                    let ny = (y as i32 + dy).max(0).min(h as i32 - 1) as u32;
+                    if img.get_pixel(nx, ny)[0] > 0 { any = true; break 'outer; }
+                }
+            }
+            out.put_pixel(x, y, Luma([if any { 255u8 } else { 0u8 }]));
+        }
+    }
+    out
+}
+
+/// 提取轮廓统计（基于 Otsu 前景分割，而非 Sobel 边缘）
+///
+/// 在灰度原图上做 Otsu 分割 → 开运算去噪 → 连通域标记，返回：
+/// - `轮廓数量`：(usize) 独立前景物体个数
+/// - `面积均值`：(f64) 物体的平均像素数
+/// - `面积方差`：(f64) 物体大小的方差
+pub fn extract_contour_stats(gray_thumb: &GrayImage) -> (usize, f64, f64) {
+    let binary = segment_foreground(gray_thumb);
+
+    // 提取轮廓
+    use imageproc::contours::find_contours;
+    let contours = find_contours::<i32>(&binary);
+
+    // 过滤面积过小的噪点轮廓
+    let min_area = 5.0;
+    let areas: Vec<f64> = contours.iter()
+        .map(|c| c.points.len() as f64)
+        .filter(|&a| a >= min_area)
+        .collect();
+
+    let count = areas.len();
+    if count == 0 { return (0, 0.0, 0.0); }
+
+    let mean = areas.iter().sum::<f64>() / count as f64;
+    let variance = areas.iter().map(|a| (a - mean) * (a - mean)).sum::<f64>() / count as f64;
+
+    (count, mean, variance)
+}
 /// 返回: 0.0 ~ 1.0
 pub fn compute_color_richness(img: &DynamicImage) -> f64 {
     // 缩放到 COLOR_SAMPLE_SIZE 就够了（颜色特征不需要高分辨率）

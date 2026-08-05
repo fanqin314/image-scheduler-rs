@@ -30,6 +30,11 @@
     background: #161b22; color: #c9d1d9; cursor: pointer;
     transition: border-color 0.2s;
   }
+  .region-select {
+    background: #161b22; border: 1px solid #30363d; border-radius: 4px;
+    color: #8b949e; font-size: 10px; padding: 2px 6px; cursor: pointer;
+  }
+  .region-select:focus { outline: none; border-color: #58a6ff; }
 
   /* ---- start ---- */
   .start-section { padding: 14px 12px; text-align: center; }
@@ -60,6 +65,11 @@
   .score-bar-wrap { flex: 1; height: 8px; border-radius: 4px; background: #21262d; overflow: hidden; }
   .score-bar { height: 100%; border-radius: 4px; transition: width 0.4s, background 0.4s; }
   .score-val { font-size: clamp(12px, 4.5cqi, 22px); font-weight: 700; font-family: 'Courier New', monospace; min-width: 48px; text-align: right; }
+  .contour-preview {
+    display: block; margin: 6px auto 0; border-radius: 6px; border: 1px solid #21262d;
+    width: clamp(80px, 40%, 140px); height: auto;
+  }
+  .contour-preview.hidden { display: none; }
 
   /* ---- chart ---- */
   .chart-wrap { display: none; padding: 6px 12px 0; position: relative; }
@@ -85,7 +95,7 @@
   .legend-val { color: #e6edf3; font-family: 'Courier New', monospace; }
 
   /* ---- stats ---- */
-  .stats { display: none; grid-template-columns: repeat(4, 1fr); gap: 4px; padding: 8px 12px; }
+  .stats { display: none; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 8px 12px; }
   .stats.show { display: grid; }
   .stat { text-align: center; background: #161b22; border-radius: 6px; padding: 6px 4px; }
   .stat .n { font-size: clamp(14px, 5.5cqi, 28px); font-weight: 700; font-family: 'Courier New', monospace; }
@@ -106,7 +116,7 @@
   .summary-title { font-size: 11px; font-weight: 700; color: #c9d1d9; }
   .summary-close { background: none; border: none; color: #8b949e; font-size: 14px; line-height: 1; cursor: pointer; padding: 2px 4px; }
   .summary-close:hover { color: #ff6666; }
-  .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px 4px; padding: 8px 10px; }
+  .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px 4px; padding: 8px 10px; }
   .sum-item { text-align: center; }
   .sum-label { font-size: 9px; color: #8b949e; margin-bottom: 2px; }
   .sum-val { font-size: clamp(11px, 4cqi, 20px); font-weight: 700; font-family: 'Courier New', monospace; color: #e6edf3; }
@@ -160,6 +170,17 @@
     <span class="title">视频实时分析</span>
     <span class="mode-badge" id="modeBadge"></span>
   </div>
+  <select id="regionSelect" class="region-select" title="切换关注区间">
+    <option value="lower">▼ 下半区</option>
+    <option value="upper">▲ 上半区</option>
+    <option value="left">◀ 左半区</option>
+    <option value="right">▶ 右半区</option>
+  </select>
+  <select id="fpsSelect" class="region-select" title="采样帧率">
+    <option value="100">极速·100ms</option>
+    <option value="200">高·200ms</option>
+    <option value="500" selected>中·500ms</option>
+  </select>
   <button id="btnPopout" class="popout" title="弹出独立窗口（不自动关闭）" style="display: none;">↗ 弹出</button>
 </div>
 
@@ -176,23 +197,23 @@
     <div class="score-bar-wrap"><div class="score-bar" id="scoreBar" style="width:0%"></div></div>
     <span class="score-val" id="scoreVal">--</span>
   </div>
+  <img id="contourPreview" class="contour-preview hidden" src="" alt="轮廓预览">
 </div>
 
 <div class="chart-wrap" id="chartWrap">
   <div class="chart-title">
-    <span id="chartTitle">六维指标 + 决策带 + 趋势线（归一化）</span>
+    <span id="chartTitle">多维指标 + 决策带 + 趋势线（归一化）</span>
     <span class="zoom-hint" id="zoomHint">（滚轮缩放 · 双击重置）</span>
   </div>
   <canvas id="chart" height="360"></canvas>
   <div class="chart-tooltip" id="chartTooltip"></div>
 </div>
 
-<div class="legend-bar" id="legendBar"><div class="legend-item" data-key="entropy"><span class="legend-dot" style="background:#00ff88"></span>熵值 <span class="legend-val">--</span></div><div class="legend-item" data-key="edge_ratio"><span class="legend-dot" style="background:#58a6ff"></span>边缘比 <span class="legend-val">--</span></div><div class="legend-item" data-key="motion"><span class="legend-dot" style="background:#ffaa44"></span>运动量 <span class="legend-val">--</span></div><div class="legend-item" data-key="local_variance"><span class="legend-dot" style="background:#bc8cff"></span>局部方差 <span class="legend-val">--</span></div><div class="legend-item" data-key="brightness"><span class="legend-dot" style="background:#ffdd44"></span>亮度 <span class="legend-val">--</span></div><div class="legend-item" data-key="color_richness"><span class="legend-dot" style="background:#44ddff"></span>色彩丰富度 <span class="legend-val">--</span></div></div>
+<div class="legend-bar" id="legendBar"><div class="legend-item" data-key="local_peak"><span class="legend-dot" style="background:局部峰值"></span>#00ff88 <span class="legend-val">--</span></div><div class="legend-item" data-key="contour_count"><span class="legend-dot" style="background:轮廓数"></span>#66ddff <span class="legend-val">--</span></div><div class="legend-item" data-key="color_richness"><span class="legend-dot" style="background:色彩"></span>#44ddff <span class="legend-val">--</span></div><div class="legend-item" data-key="edge_ratio"><span class="legend-dot" style="background:边缘比"></span>#58a6ff <span class="legend-val">--</span></div><div class="legend-item" data-key="lower_advantage"><span class="legend-dot" style="background:下半区优势"></span>#ff9966 <span class="legend-val">--</span></div><div class="legend-item" data-key="contour_area_variance"><span class="legend-dot" style="background:面积方差"></span>#ff77cc <span class="legend-val">--</span></div><div class="legend-item" data-key="entropy"><span class="legend-dot" style="background:熵值"></span>#88cc44 <span class="legend-val">--</span></div><div class="legend-item" data-key="motion"><span class="legend-dot" style="background:运动量"></span>#ffaa44 <span class="legend-val">--</span></div><div class="legend-item" data-key="local_variance"><span class="legend-dot" style="background:局部方差"></span>#bc8cff <span class="legend-val">--</span></div><div class="legend-item" data-key="brightness"><span class="legend-dot" style="background:亮度"></span>#ffdd44 <span class="legend-val">--</span></div></div>
 
 <div class="stats" id="stats">
   <div class="stat cc"><div class="l">CLOUD</div><div class="n" id="cntC">0</div><div class="pct-bar" style="width:0%"></div></div>
   <div class="stat ll"><div class="l">LOCAL</div><div class="n" id="cntL">0</div><div class="pct-bar" style="width:0%"></div></div>
-  <div class="stat dd"><div class="l">DROP</div><div class="n" id="cntD">0</div><div class="pct-bar" style="width:0%"></div></div>
   <div class="stat ff"><div class="l">FPS</div><div class="n" id="cntF">--</div><div class="pct-bar" style="width:0%"></div></div>
 </div>
 
@@ -208,7 +229,6 @@
     <div class="sum-item"><div class="sum-label">最低评分</div><div class="sum-val" id="sumMin">-</div></div>
     <div class="sum-item"><div class="sum-label">CLOUD</div><div class="sum-val cc" id="sumCloud">-</div></div>
     <div class="sum-item"><div class="sum-label">LOCAL</div><div class="sum-val ll" id="sumLocal">-</div></div>
-    <div class="sum-item"><div class="sum-label">DROP</div><div class="sum-val dd" id="sumDrop">-</div></div>
     <div class="sum-item"><div class="sum-label">平均FPS</div><div class="sum-val" id="sumFps">-</div></div>
   </div>
 </div>

@@ -17,7 +17,8 @@ pub const THUMBNAIL_SIZE: u32 = 128;
 pub const COLOR_SAMPLE_SIZE: u32 = 64;
 
 /// Sobel 边缘判定阈值。梯度幅值 > 该值视为边缘，15 可过滤传感器噪点。
-pub const SOBEL_THRESHOLD: u8 = 15;
+/// Sobel 基础阈值（暗画面用）。实际阈值 = base + 亮度×0.3，范围 20~80。
+pub const SOBEL_THRESHOLD_BASE: u8 = 15;
 
 /// 滑动窗口边长（像素）。32 保证任何物体至少被 2~3 个窗口覆盖。
 pub const WINDOW_SIZE: u32 = 32;
@@ -27,6 +28,11 @@ pub const WINDOW_STEP: u32 = 16;
 
 /// 下半区分界线（y >= 该值视为下半区）。车行场景：路面/车辆 vs 天空。
 pub const LOWER_HALF_OFFSET: u32 = 64;
+
+/// 关注的半区方向。可在运行时通过 /set-region 端点切换。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HalfRegion { Lower, Upper, Left, Right }
+pub const DEFAULT_REGION: HalfRegion = HalfRegion::Lower;
 
 /// motion 归一化除数。两帧 128x128 灰度图逐像素平均绝对差的理论上限。
 pub const MOTION_DIVISOR: f64 = 64.0;
@@ -73,10 +79,12 @@ pub const W_MOTION: f64 = 0.04;              // 帧间运动幅度
 
 // ---------- 决策阈值 (evaluator.rs) ----------
 /// 价值分 >= 该值 → 送云端 CLOUD。
-pub const THRESHOLD_CLOUD: f64 = 0.72;
+/// 0.72→0.65：配合 local_peak diff 评分整体下降约 0.05-0.10 后的调整。
+pub const THRESHOLD_CLOUD: f64 = 0.65;
 
-/// 价值分 >= 该值 → 本地处理 LOCAL；低于 LOCAL 阈值 → 丢弃 DROP。
-pub const THRESHOLD_LOCAL: f64 = 0.38;
+/// 价值分 >= 该值 → 本地处理 LOCAL（二分类兜底，去掉了 DROP）。
+/// 保留常量但决策中不再使用——亮度惩罚已处理极端场景。
+pub const THRESHOLD_LOCAL: f64 = 0.35;
 
 // ---------- 视频分析参数 (handlers.rs / video.rs) ----------
 /// 轻量检测分辨率（像素）。先用 64x64 快速筛关键帧，避免全分辨率串行分析。

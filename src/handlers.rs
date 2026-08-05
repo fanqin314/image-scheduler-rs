@@ -3,20 +3,22 @@
 // 该模块将请求、特征提取、评估、可视化串联起来，返回 JSON 响应
 
 use axum::{
-    extract::Multipart,
+    extract::{Multipart, State},
     response::{Html, IntoResponse, Json},
     Json as AxumJson,
 };
-use base64::{engine::general_purpose::STANDARD, Engine}; // Base64 编码
-use image::imageops::FilterType; // 图像缩放算法（最近邻）
+use base64::{engine::general_purpose::STANDARD, Engine};
+use image::imageops::FilterType;
+use std::sync::{Arc, Mutex};
 use crate::{
     config,
+    config::HalfRegion,
     evaluator,
     features,
     types::{AnalyzeFrameRequest, AnalyzeFrameResponse, EvaluationResponse, FeatureResponse, UploadResponse},
     visualization,
 };
-use std::io::Cursor; // 内存中的读写指针，用于将图片编码为 JPEG
+use std::io::Cursor;
 
 /// 首页处理器
 /// 返回嵌入在二进制文件中的 HTML 模板（通过 include_str! 编译时嵌入）
@@ -28,7 +30,7 @@ pub async fn index() -> Html<&'static str> {
 /// 图片上传处理器
 /// 接收前端上传的图片，执行特征提取、价值评估、生成可视化标注图，
 /// 最后以 JSON 格式返回所有结果（含 Base64 图片）
-pub async fn upload(mut multipart: Multipart) -> impl IntoResponse {
+pub async fn upload(State(region): State<Arc<Mutex<HalfRegion>>>, mut multipart: Multipart) -> impl IntoResponse {
     // --- 1. 解析 multipart，提取文件数据 ---
     // 初始化文件数据容器（Option<Vec<u8>>）
     let mut file_data = None;
@@ -64,16 +66,20 @@ pub async fn upload(mut multipart: Multipart) -> impl IntoResponse {
     };
 
     // --- 4. 调用特征提取模块，计算 10 维特征 ---
-    let feature_map = features::extract_features(&img);
+    let region = *region.lock().unwrap();
+    let feature_map = features::extract_features(&img, region);
 
     // --- 5. 调用价值评估模块，计算价值分和决策动作 ---
-    let evaluation = evaluator::evaluate(&feature_map, None);
+    let evaluation = evaluator::evaluate(&feature_map);
 
     // --- 6. 生成可视化标注图 ---
     // 6a. 获取边缘图（用于标注）
     let edge_map = features::get_edge_map(&img);
-    // 6b. 根据特征和边缘图绘制标注图（绿框、黄线等），返回 JPEG 字节
-    let vis_bytes = visualization::generate_visualization(&edge_map, &feature_map);
+    // 6b. 生成灰度缩略图作为标注背景
+    let gray_thumb_raw = image::imageops::resize(&img, 128, 128, FilterType::Nearest);
+    let gray_thumb = image::DynamicImage::from(gray_thumb_raw).into_luma8();
+    // 6c. 根据特征和边缘图绘制标注图，返回 JPEG 字节
+    let vis_bytes = visualization::generate_visualization(&gray_thumb, &edge_map, &feature_map);
 
     // --- 7. 生成原图缩略图（Base64 编码，便于前端直接显示）---
     // 缩放到 128x128 以减少传输量
@@ -118,7 +124,7 @@ pub async fn upload(mut multipart: Multipart) -> impl IntoResponse {
 /// 视频上传处理器
 /// 接收前端上传的视频文件，逐帧提取特征、评估决策，
 /// 返回每帧结果 + 摘要统计
-pub async fn upload_video(mut multipart: Multipart) -> impl IntoResponse {
+pub async fn upload_video(State(region): State<Arc<Mutex<HalfRegion>>>, mut multipart: Multipart) -> impl IntoResponse {
     // --- 1. 解析 multipart，提取视频文件 ---
     let mut file_data = None;
 
@@ -208,7 +214,8 @@ pub async fn upload_video(mut multipart: Multipart) -> impl IntoResponse {
         prev_gray = Some(small);
     }
 
-    // Phase 2: 并行处理关键帧
+    // Phase 2: 并行处理关键帧（region 需在闭包外提取，避免跨线程锁竞争）
+    let region = *region.lock().unwrap();
     let kf_indices: Vec<usize> = light_cache.iter()
         .enumerate()
         .filter(|(_, (_, _, is_kf))| *is_kf)
@@ -225,8 +232,8 @@ pub async fn upload_video(mut multipart: Multipart) -> impl IntoResponse {
             } else {
                 video_frames.frames[0].1.to_luma8()
             };
-            let feature_map = crate::features::extract_features_with_motion(img, Some(&prev_luma));
-            let evaluation = crate::evaluator::evaluate(&feature_map, None);
+            let feature_map = crate::features::extract_features_with_motion(img, Some(&prev_luma), region);
+            let evaluation = crate::evaluator::evaluate(&feature_map);
             let fr = FeatureResponse {
                 entropy: feature_map["entropy"],
                 edge_ratio: feature_map["edge_ratio"],
@@ -330,6 +337,7 @@ pub async fn upload_video(mut multipart: Multipart) -> impl IntoResponse {
 /// 实时帧分析处理器（Chrome 扩展用）
 /// 接收当前帧 + 上一帧（可选），即时返回特征与评估
 pub async fn analyze_frame(
+    State(region): State<Arc<Mutex<HalfRegion>>>,
     AxumJson(payload): AxumJson<AnalyzeFrameRequest>,
 ) -> impl IntoResponse {
     // --- 辅助：从 base64 解码为 DynamicImage ---
@@ -367,13 +375,21 @@ pub async fn analyze_frame(
     };
 
     // --- 3. 特征提取 ---
+    let region = *region.lock().unwrap();
     let feature_map = features::extract_features_with_motion(
         &cur_img,
         prev_gray.as_ref(),
+        region,
     );
 
     // --- 4. 评估 ---
-    let evaluation = evaluator::evaluate(&feature_map, None);
+    let evaluation = evaluator::evaluate(&feature_map);
+
+    // --- 4.5 生成标注图（原图灰度 + 边缘 + 轮廓 + 峰值窗） ---
+    let edge_map = features::get_edge_map(&cur_img);
+    let gray_thumb = cur_img.to_luma8();
+    let vis_bytes = visualization::generate_visualization(&gray_thumb, &edge_map, &feature_map);
+    let vis_b64 = STANDARD.encode(&vis_bytes);
 
     // --- 5. 组装响应 ---
     let response = AnalyzeFrameResponse {
@@ -393,7 +409,28 @@ pub async fn analyze_frame(
             score: evaluation.score,
             action: evaluation.action,
         },
+        visualized_image: Some(vis_b64),
     };
 
     Json(serde_json::to_value(&response).unwrap())
+}
+
+// ============================================================
+// /set-region — 运行时切换关注的半区方向
+// ============================================================
+/// POST /set-region  body: {"region":"lower"}  (lower/upper/left/right)
+/// 下一次分析即生效，无需重启服务。
+pub async fn set_region(
+    State(region): State<Arc<Mutex<HalfRegion>>>,
+    AxumJson(body): AxumJson<serde_json::Value>,
+) -> impl IntoResponse {
+    let val = body.get("region").and_then(|v| v.as_str()).unwrap_or("lower");
+    let new = match val {
+        "upper" => HalfRegion::Upper,
+        "left"  => HalfRegion::Left,
+        "right" => HalfRegion::Right,
+        _       => HalfRegion::Lower,
+    };
+    *region.lock().unwrap() = new;
+    Json(serde_json::json!({"ok": true, "region": val}))
 }

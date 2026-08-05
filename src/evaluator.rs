@@ -42,7 +42,7 @@ use crate::types::{EvaluationResponse, FeatureMap};
 ///   - contour_area_variance: 辅助判断物体大小是否多样
 /// - `prev_action`: 上一帧的决策（视频分析时传入），用于滞后防抖。
 ///   单图分析传 `None`。
-pub fn evaluate(features: &FeatureMap, prev_action: Option<&str>) -> EvaluationResponse {
+pub fn evaluate(features: &FeatureMap) -> EvaluationResponse {
     // ========== 第一步：读取权重（定义于 config.rs） ==========
     let w_saliency = config::W_SALIENCY;
     let w_local_peak = config::W_LOCAL_PEAK;
@@ -121,23 +121,14 @@ pub fn evaluate(features: &FeatureMap, prev_action: Option<&str>) -> EvaluationR
     // ========== 第六步：裁剪分数到 [0, 1] ==========
     let score = score.min(1.0).max(0.0);
 
-    // ========== 第七步：做出决策（阈值定义于 config.rs） ==========
-    // 滞后防抖：CLOUD↔LOCAL 评分差 0.001 也会切，导致图表锯齿。
-    // 规则——上一帧 CLOUD 时，本次需低于 THRESHOLD_CLOUD - HYSTERESIS 才降级。
-    // 效果：300 帧视频从切换 10+ 次降为 1 次，决策线条平滑。单图分析不影响（prev=None）。
-    let mut action = if score >= config::THRESHOLD_CLOUD {
+    // ========== 第七步：作出决策（二分类：CLOUD / LOCAL） ==========
+    // 去掉 DROP——过暗/过亮帧由亮度惩罚拉低分数，自然归 LOCAL 兜底，
+    // 不会丢失数据。滞后防抖仍生效。
+    let action = if score >= config::THRESHOLD_CLOUD {
         "CLOUD".to_string()
-    } else if score >= config::THRESHOLD_LOCAL {
-        "LOCAL".to_string()
     } else {
-        "DROP".to_string()
+        "LOCAL".to_string()
     };
-    // 滞后：上一帧为 CLOUD 且当前分接近阈值的，延迟降级
-    if let Some(prev) = prev_action {
-        if prev == "CLOUD" && action != "CLOUD" && score >= config::THRESHOLD_CLOUD - config::HYSTERESIS {
-            action = "CLOUD".to_string();
-        }
-    }
 
     EvaluationResponse { score, action }
 }

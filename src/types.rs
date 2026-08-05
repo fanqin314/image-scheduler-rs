@@ -104,8 +104,11 @@ pub struct AnalyzeFrameRequest {
 // ------------------------------------------------------------
 // 9. 实时帧分析响应
 // ------------------------------------------------------------
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct AnalyzeFrameResponse {
     pub features: FeatureResponse,
     pub evaluation: EvaluationResponse,
+    /// 标注图 Base64（128x128 边缘+轮廓+峰值窗），用于插件实时预览
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visualized_image: Option<String>,
 }

@@ -5,96 +5,79 @@
 
 use image::{DynamicImage, GrayImage, ImageBuffer, Luma, Rgb};
 use imageproc::contours::find_contours;
-use imageproc::drawing::{draw_hollow_rect, draw_line_segment};
-use imageproc::point::Point;
+use imageproc::drawing::draw_hollow_rect;
 use imageproc::rect::Rect;
 use crate::config;
+use crate::features; // 用于 segment_foreground
 use crate::types::FeatureMap;
 use std::io::Cursor;
 
-/// 生成可视化标注图，返回 JPEG 字节数据
+/// 生成可视化标注图（原图灰度 + 边缘 + Otsu分割轮廓 + 峰值窗），返回 JPEG 字节
 ///
 /// # 参数
-/// - `edge_map`: 来自 features::get_edge_map 的边缘强度图
-/// - `features`: 特征映射，用于定位"局部峰值窗口"（local_peak 对应的窗口位置）
-///
-/// # 返回值
-/// - JPEG 编码的图像字节，前端以 Base64 展示
+/// - `gray_thumb`: 原图的 128×128 灰度缩略图（作为背景）
+/// - `edge_map`: Sobel 边缘图（白色边缘叠加在背景上）
+/// - `features`: 特征映射，用于定位"局部峰值窗口"
 ///
 /// # 绘制图例
 /// | 颜色 | 含义 |
 /// |------|------|
-/// | 白色 | Sobel 边缘像素 |
-/// | 灰色网格 | 滑动窗口扫描范围 |
-/// | 绿色粗框 | 局部峰值窗口（边缘最密集的区域） |
+/// | 背景 | 原视频帧灰度 |
+/// | 白色高亮 | Sobel 边缘像素 |
 /// | 绿色细线 | 检测到的轮廓 |
-/// | 黄色横线 | 上下半区分界线（车行场景路面/天空） |
-pub fn generate_visualization(edge_map: &GrayImage, features: &FeatureMap) -> Vec<u8> {
+/// | 绿色粗框 | 局部峰值窗口 |
+pub fn generate_visualization(
+    gray_thumb: &GrayImage,
+    edge_map: &GrayImage,
+    features: &FeatureMap,
+) -> Vec<u8> {
     let (w, h) = edge_map.dimensions();
     let mut rgb: ImageBuffer<Rgb<u8>, Vec<u8>> =
         ImageBuffer::from_pixel(w, h, Rgb([0u8, 0u8, 0u8]));
 
-    // 叠加边缘（白色）
+    // 背景：原图灰度缩略图
+    for y in 0..h {
+        for x in 0..w {
+            let g = gray_thumb.get_pixel(x, y)[0];
+            rgb.put_pixel(x, y, Rgb([g, g, g]));
+        }
+    }
+
+    // 叠加边缘（白色高亮，alpha=0.7 与原图混合）
     for y in 0..h {
         for x in 0..w {
             let e = edge_map.get_pixel(x, y)[0];
             if e > 0 {
-                rgb.put_pixel(x, y, Rgb([255u8, 255u8, 255u8]));
+                let bg = gray_thumb.get_pixel(x, y)[0];
+                let blended = ((bg as u16 * 3 + 255u16 * 7) / 10) as u8;
+                rgb.put_pixel(x, y, Rgb([blended, blended, blended]));
             }
         }
     }
 
-    // 网格（灰色）：与 features.rs 的滑动窗口参数保持一致
-    let win_size = config::WINDOW_SIZE;
-    let step = config::WINDOW_STEP;
-    for y in (0..(h - win_size + 1)).step_by(step as usize) {
-        for x in (0..(w - win_size + 1)).step_by(step as usize) {
-            let rect = Rect::at(x as i32, y as i32).of_size(win_size, win_size);
-            let _ = draw_hollow_rect(&mut rgb, rect, Rgb([100u8, 100u8, 100u8]));
-        }
-    }
+    // === 绘制物体轮廓（绿色，基于 Otsu 前景分割） ===
+    let binary = features::segment_foreground(gray_thumb);
+    let contours = find_contours::<i32>(&binary);
 
-    // === 绘制轮廓线（绿色） ===
-    // 二值化边缘图
-    let mut binary = GrayImage::new(w, h);
-    for y in 0..h {
-        for x in 0..w {
-            let v = edge_map.get_pixel(x, y)[0];
-            binary.put_pixel(x, y, Luma([if v > 0 { 255u8 } else { 0u8 }]));
-        }
-    }
-
-    let contours = find_contours(&binary);
-
+    // 128x128 图中轮廓点仅 1-2px 宽→膨胀到 3x3 使其肉眼可见
     for contour in contours.iter() {
-        if contour.points.len() < 3 {
-            continue;
-        }
-        // 连接相邻点
-        for i in 0..contour.points.len() - 1 {
-            let p1: Point<i32> = contour.points[i];
-            let p2: Point<i32> = contour.points[i + 1];
-            let _ = draw_line_segment(
-                &mut rgb,
-                (p1.x as f32, p1.y as f32),
-                (p2.x as f32, p2.y as f32),
-                Rgb([0u8, 255u8, 0u8]),
-            );
-        }
-        // 闭合轮廓
-        if let (Some(first), Some(last)) = (contour.points.first(), contour.points.last()) {
-            let p1: Point<i32> = *first;
-            let p2: Point<i32> = *last;
-            let _ = draw_line_segment(
-                &mut rgb,
-                (p1.x as f32, p1.y as f32),
-                (p2.x as f32, p2.y as f32),
-                Rgb([0u8, 255u8, 0u8]),
-            );
+        if contour.points.len() < 4 { continue; }
+        for pt in &contour.points {
+            let px = pt.x as i32;
+            let py = pt.y as i32;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let nx = (px + dx).max(0).min(w as i32 - 1) as u32;
+                    let ny = (py + dy).max(0).min(h as i32 - 1) as u32;
+                    rgb.put_pixel(nx, ny, Rgb([0u8, 255u8, 0u8]));
+                }
+            }
         }
     }
 
     // 高亮局部峰值窗口（绿色粗框）
+    let win_size = config::WINDOW_SIZE;
+    let step = config::WINDOW_STEP;
     let peak = *features.get("local_peak").unwrap_or(&0.0);
     if peak > 0.0 {
         let mut max_ratio = 0.0;
@@ -124,12 +107,6 @@ pub fn generate_visualization(edge_map: &GrayImage, features: &FeatureMap) -> Ve
         }
         let rect = Rect::at(best_x as i32, best_y as i32).of_size(win_size, win_size);
         let _ = draw_hollow_rect(&mut rgb, rect, Rgb([0u8, 255u8, 0u8]));
-    }
-
-    // 下半区分隔线（黄色）
-    let half_y = (h / 2) as i32;
-    for x in 0..w as i32 {
-        rgb.put_pixel(x as u32, half_y as u32, Rgb([255u8, 255u8, 0u8]));
     }
 
     // 编码为 JPEG

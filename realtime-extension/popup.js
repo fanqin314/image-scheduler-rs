@@ -7,18 +7,22 @@
 //   score < 0.38  → DROP（丢弃）
 // ============================================================
 
-const POLL_MS = 800;
+let POLL_MS = 800;
 const DISPLAY_WINDOW = 150;  // 图表最多显示最近 150 帧（滑动窗口）
 
 // 指标与图表共用同一份数据源（key 与后端 FeatureResponse 字段一致）
 // norm(v) 将原始特征值映射到 0~1，用于指标条宽度；max 为图表动态上限下限
 const FEATURES = [
-  { key: 'entropy',         name: '熵值',       color: '#00ff88', max: 8.0,  dec: 2, norm: v => v / 8.0 },
-  { key: 'edge_ratio',      name: '边缘比',     color: '#58a6ff', max: 1.0,  dec: 3, norm: v => v / 1.0 },
-  { key: 'motion',          name: '运动量',     color: '#ffaa44', max: 30.0, dec: 2, norm: v => v / 30.0 },
-  { key: 'local_variance',  name: '局部方差',   color: '#bc8cff', max: 0.05, dec: 4, norm: v => v / (v + 1) },
-  { key: 'brightness',      name: '亮度',       color: '#ffdd44', max: 1.0,  dec: 3, norm: v => v / 1.0 },
-  { key: 'color_richness',  name: '色彩丰富度', color: '#44ddff', max: 1.0,  dec: 3, norm: v => v / 1.0 },
+  { key: 'local_peak',           name: '局部峰值',   color: '#00ff88', max: 1.0,  dec: 3, norm: v => v / 1.0 },
+  { key: 'contour_count',        name: '轮廓数',     color: '#66ddff', max: 30.0, dec: 1, norm: v => v / 30.0 },
+  { key: 'color_richness',       name: '色彩',       color: '#44ddff', max: 1.0,  dec: 2, norm: v => v / 1.0 },
+  { key: 'edge_ratio',           name: '边缘比',     color: '#58a6ff', max: 1.0,  dec: 3, norm: v => v / 1.0 },
+  { key: 'lower_advantage',      name: '下半区优势', color: '#ff9966', max: 3.0,  dec: 2, norm: v => v / 3.0 },
+  { key: 'contour_area_variance',name: '面积方差',   color: '#ff77cc', max: 0.5,  dec: 3, norm: v => v / (v + 0.1) },
+  { key: 'entropy',              name: '熵值',       color: '#88cc44', max: 8.0,  dec: 2, norm: v => v / 8.0 },
+  { key: 'motion',               name: '运动量',     color: '#ffaa44', max: 64.0, dec: 1, norm: v => v / 64.0 },
+  { key: 'local_variance',       name: '局部方差',   color: '#bc8cff', max: 0.05, dec: 4, norm: v => v / (v + 1) },
+  { key: 'brightness',           name: '亮度',       color: '#ffdd44', max: 1.0,  dec: 3, norm: v => v / 1.0 },
 ];
 // 图表折线直接复用 FEATURES（去重保证指标卡与图表口径一致）
 const LINES = FEATURES.map(f => ({ key: f.key, color: f.color, name: f.name }));
@@ -26,8 +30,8 @@ const LINES = FEATURES.map(f => ({ key: f.key, color: f.color, name: f.name }));
 const NORM_MAX = Object.fromEntries(FEATURES.map(f => [f.key, f.max]));
 
 // 决策阈值（与后端 config.rs 保持一致）
-const THRESHOLD_CLOUD = 0.72;
-const THRESHOLD_LOCAL = 0.38;
+const THRESHOLD_CLOUD = 0.65;
+const THRESHOLD_LOCAL = 0.35;
 
 // DOM refs
 const btnStart   = document.getElementById('btnStart');
@@ -44,7 +48,6 @@ const legendBar  = document.getElementById('legendBar');
 const statsEl    = document.getElementById('stats');
 const cntC       = document.getElementById('cntC');
 const cntL       = document.getElementById('cntL');
-const cntD       = document.getElementById('cntD');
 const cntF       = document.getElementById('cntF');
 const summaryCard = document.getElementById('summaryCard');
 const summaryClose = document.getElementById('summaryClose');
@@ -54,13 +57,34 @@ const sumMax     = document.getElementById('sumMax');
 const sumMin     = document.getElementById('sumMin');
 const sumCloud   = document.getElementById('sumCloud');
 const sumLocal   = document.getElementById('sumLocal');
-const sumDrop    = document.getElementById('sumDrop');
 const sumFps     = document.getElementById('sumFps');
 const historyPanel = document.getElementById('historyPanel');
 const historyList  = document.getElementById('historyList');
 const historyClear = document.getElementById('historyClear');
 const footerEl   = document.getElementById('footer');
 const modeBadge  = document.getElementById('modeBadge');
+const regionSel = document.getElementById('regionSelect');
+const fpsSel = document.getElementById('fpsSelect');
+
+// 关注区间切换
+regionSel.addEventListener('change', async () => {
+  const val = regionSel.value;
+  try {
+    await chrome.runtime.sendMessage({ type: 'setRegion', region: val });
+    footerEl.textContent = `关注区间已切换，若正在分析中请重新开始`;
+  } catch (_) { footerEl.textContent = '切换失败，请确认后端已启动'; }
+});
+
+// 采样帧率切换
+fpsSel.addEventListener('change', async () => {
+  const ms = +fpsSel.value;
+  try {
+    await sendToContent({ type: 'setFps', ms });
+    POLL_MS = ms + 200;
+    if (analyzing) startPolling();
+    footerEl.textContent = `采样帧率已切换为 ${ms}ms`;
+  } catch (_) { footerEl.textContent = '切换失败'; }
+});
 
 let timer        = null;
 let analyzing    = false;
@@ -209,7 +233,7 @@ function setUIStopped() {
   legendBar.classList.remove('show');
   statsEl.classList.remove('show');
   summaryCard.classList.remove('show');
-  modeBadge.classList.remove('show', 'cloud', 'local', 'drop');
+  modeBadge.classList.remove('show', 'cloud', 'local');
   footerEl.textContent = '点击按钮开始';
   lastHistoryLen = 0;
   chartHist = [];
@@ -264,24 +288,30 @@ function render(state) {
     scoreVal.style.color = color;
   }
 
+  // 轮廓预览图（最新帧的 128x128 标注图）
+  const preview = document.getElementById('contourPreview');
+  if (latest && latest.vis) {
+    preview.src = 'data:image/jpeg;base64,' + latest.vis;
+    preview.classList.remove('hidden');
+  } else {
+    preview.classList.add('hidden');
+  }
+
   // 模式徽章
   if (latest) {
     const action = (latest.evaluation.action || '').toUpperCase();
     modeBadge.textContent = action;
-    modeBadge.className = 'mode-badge show ' + (action === 'CLOUD' ? 'cloud' : action === 'DROP' ? 'drop' : 'local');
+    modeBadge.className = 'mode-badge show ' + (action === 'CLOUD' ? 'cloud' : 'local');
   }
 
   // 统计
   const cc = hist.filter(h => h.evaluation.action === 'CLOUD').length;
   const ll = hist.filter(h => h.evaluation.action === 'LOCAL').length;
-  const dd = hist.filter(h => h.evaluation.action === 'DROP').length;
-  const total = cc + ll + dd || 1;
+  const total = cc + ll || 1;
   cntC.textContent = cc;
   cntL.textContent = ll;
-  cntD.textContent = dd;
   cntC.parentElement.querySelector('.pct-bar').style.width = (cc / total * 100).toFixed(1) + '%';
   cntL.parentElement.querySelector('.pct-bar').style.width = (ll / total * 100).toFixed(1) + '%';
-  cntD.parentElement.querySelector('.pct-bar').style.width = (dd / total * 100).toFixed(1) + '%';
 
   // FPS: 最近 3 秒内帧数 / 3
   if (hist.length >= 2) {
@@ -313,7 +343,6 @@ function render(state) {
     sumMin.textContent = Math.min(...scores).toFixed(0);
     sumCloud.textContent = cc;
     sumLocal.textContent = ll;
-    sumDrop.textContent = dd;
     sumFps.textContent = cntF.textContent;
   }
 
@@ -358,8 +387,8 @@ function drawChart(hist) {
     dynMax[line.key] = Math.max(NORM_MAX[line.key], ...hist.map(h => h.features[line.key] || 0));
   }
 
-  // ========== 分面图：6 指标行 + 评分行 + 决策带 ==========
-  const ROWS = 6;                     // 指标行数
+  // ========== 分面图：N 指标行 + 评分行 + 决策带 + 导航条 ==========
+  const ROWS = LINES.length;           // 动态适配 FEATURES 数量
   const nRows = ROWS + 3;             // +评分 +决策 +导航条
   const rowGap = 2 * dpr;
   const rowH = (ph - (nRows - 1) * rowGap) / nRows;
@@ -636,7 +665,7 @@ function renderHistory(logs) {
     return `<div class="history-item" data-id="${l.id}">
       <div class="history-info">
         <div class="hi-title" title="${l.title || l.url || ''}">${tt}</div>
-        <div class="hi-meta">${ts} · ${l.totalFrames}帧 C${l.cloudCount} L${l.localCount} D${l.dropCount}</div>
+        <div class="hi-meta">${ts} · ${l.totalFrames}帧 C${l.cloudCount} L${l.localCount}</div>
       </div>
       <div class="history-actions">
         <button class="hi-btn dl" data-action="dl">下载</button>

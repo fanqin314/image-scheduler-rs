@@ -65,6 +65,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       .catch(err => sendResponse({ ok: false, error: err.message }));
     return true;
   }
+  if (msg.type === 'setRegion') {
+    // 切换关注区间 → POST /set-region
+    fetch('http://127.0.0.1:5000/set-region', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ region: msg.region }),
+    })
+      .then(async r => { sendResponse(await r.json()); })
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
   if (msg.type === 'saveLog') {
     // 存储到 chrome.storage.local（最多保留 20 条），不立刻下载
     (async () => {

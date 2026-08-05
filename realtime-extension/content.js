@@ -8,9 +8,10 @@
 // ============================================================
 
 // ----- 可调参数 -----
-const THROTTLE_MS = 500;        // 两次分析的间隔（毫秒），500ms ≈ 2fps
-const RESIZE_W = 128;           // 截帧缩放宽度（与后端 THUMBNAIL_SIZE 一致）
-const RESIZE_H = 128;           // 截帧缩放高度
+let THROTTLE_MS = 500;        // 采样间隔（毫秒），可通过 setFps 消息动态切换
+let lastFrameTs = 0;           // 上一帧时间戳，用于 motion 归一化
+const RESIZE_W = 128;
+const RESIZE_H = 128;
 const JPEG_QUALITY = 0.55;      // 截帧 JPEG 压缩质量（0~1，越小越省流量）
 const HISTORY_MAX = 300;        // 历史记录条数上限（超出丢弃最旧）
 
@@ -100,7 +101,14 @@ async function analyzeFrame(now, metadata) {
     if (!resp.ok) throw new Error(resp.error || 'HTTP fail');
     const data = resp.data;
     if (data.features && data.evaluation) {
-      history.push({ seq: frameSeq, ts: Date.now(), features: data.features, evaluation: data.evaluation });
+      // motion 归一化：按实际时间差折算到 500ms 基准，消除帧率影响
+      const now = Date.now();
+      const dt = lastFrameTs ? (now - lastFrameTs) : THROTTLE_MS;
+      lastFrameTs = now;
+      if (data.features.motion != null) {
+        data.features.motion = data.features.motion * (500 / Math.max(dt, 1));
+      }
+      history.push({ seq: frameSeq, ts: now, features: data.features, evaluation: data.evaluation, vis: data.visualized_image });
       if (history.length > HISTORY_MAX) history.shift();
       frameSeq++;
     }
@@ -284,6 +292,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   } else if (msg.type === 'stopAnalysis') {
     fullStop();
     sendResponse({ stopped: true });
+  } else if (msg.type === 'setFps') {
+    // 切换采样间隔：250/500/1000ms
+    THROTTLE_MS = msg.ms || 500;
+    sendResponse({ set: true, ms: THROTTLE_MS });
   } else if (msg.type === 'getState') {
     sendResponse({
       connected: !!video,

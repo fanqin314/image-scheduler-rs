@@ -24,7 +24,10 @@ use axum::{
 };
 use tower_http::trace::TraceLayer;  // 日志中间件，自动打印请求日志
 
-// ============================================================
+// 运行时共享状态：用户可通过 /set-region 端点切换关注的半区方向
+use std::sync::{Arc, Mutex};
+use crate::config::HalfRegion;
+
 // 主函数入口
 // 先同步执行 ffmpeg 下载（避免 reqwest::blocking 与 tokio 运行时冲突），
 // 再进入 tokio 异步运行时启动 HTTP 服务。
@@ -56,11 +59,15 @@ async fn async_main() {
     //   - handlers::upload 处理图片上传，返回 JSON 格式的特征和决策
     // .layer(TraceLayer::new_for_http())
     //   - 添加日志中间件，每个请求都会打印方法、路径、状态码和耗时
+    // 运行时共享状态：关注的半区方向，/set-region 端点可切换
+    let region = Arc::new(Mutex::new(config::DEFAULT_REGION));
     let app = Router::new()
         .route("/", get(handlers::index))
         .route("/upload", post(handlers::upload))
         .route("/upload-video", post(handlers::upload_video))
         .route("/analyze-frame", post(handlers::analyze_frame))
+        .route("/set-region", post(handlers::set_region))
+        .with_state(region)
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))  // 256MB，匹配前端提示
         .layer(TraceLayer::new_for_http());
 
