@@ -67,7 +67,7 @@ pub async fn upload(mut multipart: Multipart) -> impl IntoResponse {
     let feature_map = features::extract_features(&img);
 
     // --- 5. 调用价值评估模块，计算价值分和决策动作 ---
-    let evaluation = evaluator::evaluate(&feature_map);
+    let evaluation = evaluator::evaluate(&feature_map, None);
 
     // --- 6. 生成可视化标注图 ---
     // 6a. 获取边缘图（用于标注）
@@ -226,7 +226,7 @@ pub async fn upload_video(mut multipart: Multipart) -> impl IntoResponse {
                 video_frames.frames[0].1.to_luma8()
             };
             let feature_map = crate::features::extract_features_with_motion(img, Some(&prev_luma));
-            let evaluation = crate::evaluator::evaluate(&feature_map);
+            let evaluation = crate::evaluator::evaluate(&feature_map, None);
             let fr = FeatureResponse {
                 entropy: feature_map["entropy"],
                 edge_ratio: feature_map["edge_ratio"],
@@ -256,13 +256,21 @@ pub async fn upload_video(mut multipart: Multipart) -> impl IntoResponse {
     let (mut total_score, mut cloud_count, mut local_count, mut drop_count) = (0.0, 0, 0, 0);
     let (mut max_entropy, mut max_motion) = (0.0, 0.0);
     let mut last_kf_res: Option<(FeatureResponse, EvaluationResponse)> = None;
+    let mut prev_action: Option<String> = None;  // 滞后防抖
 
     for i in 0..n {
         let (timestamp, _img) = &video_frames.frames[i];
         let (brightness, motion, is_keyframe) = light_cache[i];
 
         if is_keyframe {
-            let (fr, ev) = kf_map[&i].clone();
+            let (fr, mut ev) = kf_map[&i].clone();
+            // 滞后：上一帧 CLOUD 且当前分接近阈值 → 保持 CLOUD
+            if let Some(ref prev) = prev_action {
+                if prev == "CLOUD" && ev.action != "CLOUD" && ev.score >= config::THRESHOLD_CLOUD - config::HYSTERESIS {
+                    ev.action = "CLOUD".to_string();
+                }
+            }
+            prev_action = Some(ev.action.clone());
             total_score += ev.score;
             match ev.action.as_str() {
                 "CLOUD" => cloud_count += 1,
@@ -364,7 +372,7 @@ pub async fn analyze_frame(
     );
 
     // --- 4. 评估 ---
-    let evaluation = evaluator::evaluate(&feature_map);
+    let evaluation = evaluator::evaluate(&feature_map, None);
 
     // --- 5. 组装响应 ---
     let response = AnalyzeFrameResponse {

@@ -40,7 +40,9 @@ use crate::types::{EvaluationResponse, FeatureMap};
 ///   - motion: 风险触发器，留位置给视频流
 ///   - entropy: 基础筛选用
 ///   - contour_area_variance: 辅助判断物体大小是否多样
-pub fn evaluate(features: &FeatureMap) -> EvaluationResponse {
+/// - `prev_action`: 上一帧的决策（视频分析时传入），用于滞后防抖。
+///   单图分析传 `None`。
+pub fn evaluate(features: &FeatureMap, prev_action: Option<&str>) -> EvaluationResponse {
     // ========== 第一步：读取权重（定义于 config.rs） ==========
     let w_saliency = config::W_SALIENCY;
     let w_local_peak = config::W_LOCAL_PEAK;
@@ -53,8 +55,10 @@ pub fn evaluate(features: &FeatureMap) -> EvaluationResponse {
     let w_motion = config::W_MOTION;
 
     // ========== 第二步：读取特征值 ==========
-    let local_peak = features["local_peak"];
-    let edge_ratio = features["edge_ratio"];
+    let local_peak_raw = features["local_peak"];           // 原始值（最密集窗口的密度）
+    let edge_ratio = features["edge_ratio"];               // 全局边缘占比
+    // 局部峰值改用"高出全局多少"，防止高纹理场景中恒为 1.0
+    let local_peak = (local_peak_raw - edge_ratio).max(0.0);
     let lower_advantage = features["lower_advantage"];
     let motion = features["motion"];
     let entropy = features["entropy"];
@@ -65,9 +69,9 @@ pub fn evaluate(features: &FeatureMap) -> EvaluationResponse {
     let color_richness = features["color_richness"];
 
     // ========== 第三步：归一化 ==========
-    // 主体-背景对比度：local_peak / (edge_ratio + 0.05)，上限 SALIENCY_MAX
-    // 0.05 为平滑项，防止 edge_ratio 为 0 时除零
-    let saliency_raw = local_peak / (edge_ratio + 0.05);
+    // 主体-背景对比度：局部峰值密度 / (全局边缘 + 0.05)，上限 SALIENCY_MAX
+    // 用原始值而非差值——saliency = 相对突出程度
+    let saliency_raw = local_peak_raw / (edge_ratio + 0.05);
     let saliency = (saliency_raw / config::SALIENCY_MAX).min(1.0);
 
     // 轮廓数量：上限 CONTOUR_COUNT_MAX（该值以下已非常密集）
@@ -115,14 +119,21 @@ pub fn evaluate(features: &FeatureMap) -> EvaluationResponse {
     // ========== 第六步：裁剪分数到 [0, 1] ==========
     let score = score.min(1.0).max(0.0);
 
-    // ========== 第七步：做出决策（阈值定义于 config.rs，微调可减少边界抖动） ==========
-    let action = if score >= config::THRESHOLD_CLOUD {
+    // ========== 第七步：做出决策（阈值定义于 config.rs） ==========
+    // 滞后逻辑：防止 CLOUD↔LOCAL 边界因评分微小波动而反复横跳
+    let mut action = if score >= config::THRESHOLD_CLOUD {
         "CLOUD".to_string()
     } else if score >= config::THRESHOLD_LOCAL {
         "LOCAL".to_string()
     } else {
         "DROP".to_string()
     };
+    // 滞后：上一帧为 CLOUD 且当前分接近阈值的，延迟降级
+    if let Some(prev) = prev_action {
+        if prev == "CLOUD" && action != "CLOUD" && score >= config::THRESHOLD_CLOUD - config::HYSTERESIS {
+            action = "CLOUD".to_string();
+        }
+    }
 
     EvaluationResponse { score, action }
 }

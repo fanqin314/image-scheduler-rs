@@ -34,8 +34,12 @@ pub const MOTION_DIVISOR: f64 = 64.0;
 /// 轮廓数量归一化上限。128x128 缩略图下 12 个轮廓已非常密集。
 pub const CONTOUR_COUNT_MAX: f64 = 12.0;
 
-/// 色相分箱数量。将 0~360° 色相环均分为 12 个 bin。
-pub const HUE_BINS: usize = 12;
+/// 色相分箱数量。将 0~360° 色相环均分。24 = 每 15° 一个 bin，比 12 更精细。
+pub const HUE_BINS: usize = 24;
+
+/// 决策滞后宽度：上一帧为 CLOUD 时，本次需低于 THRESHOLD_CLOUD - HYSTERESIS 才降级。
+/// 防止 CLOUD↔LOCAL 边界反复横跳。
+pub const HYSTERESIS: f64 = 0.03;
 
 /// 8 位灰度图的香农熵理论上限（log2(256)）。
 pub const ENTROPY_MAX: f64 = 8.0;

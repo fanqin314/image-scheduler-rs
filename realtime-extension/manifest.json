@@ -3,12 +3,14 @@
   "name": "Video Realtime Analyzer",
   "version": "0.2.0",
   "description": "通用视频实时画面分析，支持任意网站",
-  "permissions": ["tabs", "scripting", "nativeMessaging", "downloads"],
+  "permissions": ["tabs", "scripting", "nativeMessaging", "downloads", "sidePanel", "storage"],
   "host_permissions": [
     "http://127.0.0.1:5000/*"
   ],
+  "side_panel": {
+    "default_path": "popup.html"
+  },
   "action": {
-    "default_popup": "popup.html",
     "default_title": "视频实时分析"
   },
   "background": {
