@@ -3,21 +3,22 @@
 // 功能：生成可视化标注图（边缘叠加 + 网格 + 轮廓 + 峰值窗口高亮）
 // ================================================================
 
-use image::{DynamicImage, GrayImage, ImageBuffer, Luma, Rgb};
+use image::{DynamicImage, GrayImage, ImageBuffer, Rgb};
 use imageproc::contours::find_contours;
 use imageproc::drawing::draw_hollow_rect;
 use imageproc::rect::Rect;
 use crate::config;
-use crate::features; // 用于 segment_foreground
-use crate::types::FeatureMap;
+use crate::features; // 用于 segment_foreground 与 sliding_window_features
 use std::io::Cursor;
 
 /// 生成可视化标注图（原图灰度 + 边缘 + Otsu分割轮廓 + 峰值窗），返回 JPEG 字节
 ///
 /// # 参数
-/// - `gray_thumb`: 原图的 128×128 灰度缩略图（作为背景）
-/// - `edge_map`: Sobel 边缘图（白色边缘叠加在背景上）
-/// - `features`: 特征映射，用于定位"局部峰值窗口"
+/// - `gray_thumb`: 原图的 THUMBNAIL_SIZE 见方灰度缩略图（作为背景）
+/// - `edge_map`: Sobel **二值**边缘图（白色边缘叠加在背景上）
+///
+/// 峰值窗口位置由本函数基于 `edge_map` 现算，与特征提取口径一致，
+/// 因此无需额外传入特征映射。
 ///
 /// # 绘制图例
 /// | 颜色 | 含义 |
@@ -26,11 +27,7 @@ use std::io::Cursor;
 /// | 白色高亮 | Sobel 边缘像素 |
 /// | 绿色细线 | 检测到的轮廓 |
 /// | 绿色粗框 | 局部峰值窗口 |
-pub fn generate_visualization(
-    gray_thumb: &GrayImage,
-    edge_map: &GrayImage,
-    features: &FeatureMap,
-) -> Vec<u8> {
+pub fn generate_visualization(gray_thumb: &GrayImage, edge_map: &GrayImage) -> Vec<u8> {
     let (w, h) = edge_map.dimensions();
     let mut rgb: ImageBuffer<Rgb<u8>, Vec<u8>> =
         ImageBuffer::from_pixel(w, h, Rgb([0u8, 0u8, 0u8]));
@@ -76,36 +73,14 @@ pub fn generate_visualization(
     }
 
     // 高亮局部峰值窗口（绿色粗框）
-    let win_size = config::WINDOW_SIZE;
-    let step = config::WINDOW_STEP;
-    let peak = *features.get("local_peak").unwrap_or(&0.0);
+    // 复用特征提取模块的滑动窗口函数（积分图实现，整体 O(N)），
+    // 避免在此再逐像素重扫全部窗口（原实现约 5 万次采样），
+    // 同时保证高亮的窗口与 local_peak 特征的取值口径完全一致。
+    let (peak, _variance, (best_x, best_y)) =
+        features::sliding_window_features(edge_map, config::WINDOW_SIZE, config::WINDOW_STEP);
     if peak > 0.0 {
-        let mut max_ratio = 0.0;
-        let mut best_x = 0;
-        let mut best_y = 0;
-        let mut y = 0;
-        while y + win_size <= h {
-            let mut x = 0;
-            while x + win_size <= w {
-                let mut count = 0u64;
-                for i in 0..win_size {
-                    for j in 0..win_size {
-                        if edge_map.get_pixel(x + i, y + j)[0] > 0 {
-                            count += 1;
-                        }
-                    }
-                }
-                let ratio = count as f64 / (win_size * win_size) as f64;
-                if ratio > max_ratio {
-                    max_ratio = ratio;
-                    best_x = x;
-                    best_y = y;
-                }
-                x += step;
-            }
-            y += step;
-        }
-        let rect = Rect::at(best_x as i32, best_y as i32).of_size(win_size, win_size);
+        let rect = Rect::at(best_x as i32, best_y as i32)
+            .of_size(config::WINDOW_SIZE, config::WINDOW_SIZE);
         let _ = draw_hollow_rect(&mut rgb, rect, Rgb([0u8, 255u8, 0u8]));
     }
 

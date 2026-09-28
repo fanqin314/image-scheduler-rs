@@ -9,16 +9,34 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use image::imageops::FilterType;
-use std::sync::{Arc, Mutex};
 use crate::{
     config,
-    config::HalfRegion,
     evaluator,
     features,
-    types::{AnalyzeFrameRequest, AnalyzeFrameResponse, EvaluationResponse, FeatureResponse, UploadResponse},
+    types::{
+        AnalyzeFrameRequest, AnalyzeFrameResponse, EvaluationResponse, FeatureMap,
+        FeatureResponse, UploadResponse,
+    },
     visualization,
+    AppState,
 };
 use std::io::Cursor;
+
+// ============================================================
+// 统一评估入口（含自适应阈值）
+// ============================================================
+
+/// 评估一帧。启用自适应阈值时，顺带把分数喂回窗口以驱动后续校准。
+fn evaluate_frame(state: &AppState, feature_map: &FeatureMap) -> EvaluationResponse {
+    if !config::ADAPTIVE_THRESHOLD {
+        return evaluator::evaluate(feature_map);
+    }
+    // 同一把锁内完成"取阈值 + 回写分数"，避免并发下的读写撕裂
+    let mut th = state.threshold.lock().unwrap();
+    let evaluation = evaluator::evaluate_with_threshold(feature_map, th.threshold());
+    th.push(evaluation.score);
+    evaluation
+}
 
 /// 首页处理器
 /// 返回嵌入在二进制文件中的 HTML 模板（通过 include_str! 编译时嵌入）
@@ -30,7 +48,7 @@ pub async fn index() -> Html<&'static str> {
 /// 图片上传处理器
 /// 接收前端上传的图片，执行特征提取、价值评估、生成可视化标注图，
 /// 最后以 JSON 格式返回所有结果（含 Base64 图片）
-pub async fn upload(State(region): State<Arc<Mutex<HalfRegion>>>, mut multipart: Multipart) -> impl IntoResponse {
+pub async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
     // --- 1. 解析 multipart，提取文件数据 ---
     // 初始化文件数据容器（Option<Vec<u8>>）
     let mut file_data = None;
@@ -66,24 +84,34 @@ pub async fn upload(State(region): State<Arc<Mutex<HalfRegion>>>, mut multipart:
     };
 
     // --- 4. 调用特征提取模块，计算 10 维特征 ---
-    let region = *region.lock().unwrap();
+    let region = *state.region.lock().unwrap();
     let feature_map = features::extract_features(&img, region);
 
     // --- 5. 调用价值评估模块，计算价值分和决策动作 ---
-    let evaluation = evaluator::evaluate(&feature_map);
+    let evaluation = evaluate_frame(&state, &feature_map);
 
     // --- 6. 生成可视化标注图 ---
     // 6a. 获取边缘图（用于标注）
     let edge_map = features::get_edge_map(&img);
-    // 6b. 生成灰度缩略图作为标注背景
-    let gray_thumb_raw = image::imageops::resize(&img, 128, 128, FilterType::Nearest);
-    let gray_thumb = image::DynamicImage::from(gray_thumb_raw).into_luma8();
+    // 6b. 生成灰度缩略图作为标注背景（尺寸须与 edge_map 一致）
+    // 直接对灰度图缩放，省去"先缩放 RGBA 再转灰度"的中间步骤
+    let gray_thumb = image::imageops::resize(
+        &img.to_luma8(),
+        config::THUMBNAIL_SIZE,
+        config::THUMBNAIL_SIZE,
+        FilterType::Nearest,
+    );
     // 6c. 根据特征和边缘图绘制标注图，返回 JPEG 字节
-    let vis_bytes = visualization::generate_visualization(&gray_thumb, &edge_map, &feature_map);
+    let vis_bytes = visualization::generate_visualization(&gray_thumb, &edge_map);
 
     // --- 7. 生成原图缩略图（Base64 编码，便于前端直接显示）---
-    // 缩放到 128x128 以减少传输量
-    let thumb = image::imageops::resize(&img, 128, 128, FilterType::Nearest);
+    // 缩放到 THUMBNAIL_SIZE 以减少传输量
+    let thumb = image::imageops::resize(
+        &img,
+        config::THUMBNAIL_SIZE,
+        config::THUMBNAIL_SIZE,
+        FilterType::Nearest,
+    );
     let mut thumb_buf = Vec::new();          // 内存缓冲区
     let mut cursor = Cursor::new(&mut thumb_buf); // 包装为可 Seek 的写入器
     // 以 JPEG 格式（质量 85）写入缩略图
@@ -124,7 +152,7 @@ pub async fn upload(State(region): State<Arc<Mutex<HalfRegion>>>, mut multipart:
 /// 视频上传处理器
 /// 接收前端上传的视频文件，逐帧提取特征、评估决策，
 /// 返回每帧结果 + 摘要统计
-pub async fn upload_video(State(region): State<Arc<Mutex<HalfRegion>>>, mut multipart: Multipart) -> impl IntoResponse {
+pub async fn upload_video(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
     // --- 1. 解析 multipart，提取视频文件 ---
     let mut file_data = None;
 
@@ -215,7 +243,7 @@ pub async fn upload_video(State(region): State<Arc<Mutex<HalfRegion>>>, mut mult
     }
 
     // Phase 2: 并行处理关键帧（region 需在闭包外提取，避免跨线程锁竞争）
-    let region = *region.lock().unwrap();
+    let region = *state.region.lock().unwrap();
     let kf_indices: Vec<usize> = light_cache.iter()
         .enumerate()
         .filter(|(_, (_, _, is_kf))| *is_kf)
@@ -271,10 +299,30 @@ pub async fn upload_video(State(region): State<Arc<Mutex<HalfRegion>>>, mut mult
 
         if is_keyframe {
             let (fr, mut ev) = kf_map[&i].clone();
+
+            // 阈值必须在**串行**阶段求解：自适应阈值依赖历史分数，
+            // 而 rayon 并行求值无法保证顺序。分数本身与阈值无关，
+            // 因此并行阶段照常算分，这里只负责定阈值与判决策。
+            let threshold = if config::ADAPTIVE_THRESHOLD {
+                let mut th = state.threshold.lock().unwrap();
+                let t = th.threshold();
+                th.push(ev.score);
+                t
+            } else {
+                config::THRESHOLD_CLOUD
+            };
+
+            // 按当前阈值重判（非自适应时与并行阶段结果一致）
+            ev.action = if ev.score >= threshold {
+                "CLOUD".to_string()
+            } else {
+                "LOCAL".to_string()
+            };
+
             // 滞后防抖（在此做而非并行求值中，因 rayon 无序无法传 prev_action）
             // 效果：消除相邻帧评分 0.001 波动导致的 CLOUD↔LOCAL 决策翻转
             if let Some(ref prev) = prev_action {
-                if prev == "CLOUD" && ev.action != "CLOUD" && ev.score >= config::THRESHOLD_CLOUD - config::HYSTERESIS {
+                if prev == "CLOUD" && ev.action != "CLOUD" && ev.score >= threshold - config::HYSTERESIS {
                     ev.action = "CLOUD".to_string();
                 }
             }
@@ -337,7 +385,7 @@ pub async fn upload_video(State(region): State<Arc<Mutex<HalfRegion>>>, mut mult
 /// 实时帧分析处理器（Chrome 扩展用）
 /// 接收当前帧 + 上一帧（可选），即时返回特征与评估
 pub async fn analyze_frame(
-    State(region): State<Arc<Mutex<HalfRegion>>>,
+    State(state): State<AppState>,
     AxumJson(payload): AxumJson<AnalyzeFrameRequest>,
 ) -> impl IntoResponse {
     // --- 辅助：从 base64 解码为 DynamicImage ---
@@ -375,7 +423,7 @@ pub async fn analyze_frame(
     };
 
     // --- 3. 特征提取 ---
-    let region = *region.lock().unwrap();
+    let region = *state.region.lock().unwrap();
     let feature_map = features::extract_features_with_motion(
         &cur_img,
         prev_gray.as_ref(),
@@ -383,12 +431,20 @@ pub async fn analyze_frame(
     );
 
     // --- 4. 评估 ---
-    let evaluation = evaluator::evaluate(&feature_map);
+    let evaluation = evaluate_frame(&state, &feature_map);
 
     // --- 4.5 生成标注图（原图灰度 + 边缘 + 轮廓 + 峰值窗） ---
     let edge_map = features::get_edge_map(&cur_img);
-    let gray_thumb = cur_img.to_luma8();
-    let vis_bytes = visualization::generate_visualization(&gray_thumb, &edge_map, &feature_map);
+    // 必须与 edge_map 同为 THUMBNAIL_SIZE：generate_visualization 以 edge_map
+    // 的尺寸建画布并逐像素取 gray_thumb，若传入原尺寸灰度图，
+    // 小图会越界 panic，大图则只截取左上角一块。
+    let gray_thumb = image::imageops::resize(
+        &cur_img.to_luma8(),
+        config::THUMBNAIL_SIZE,
+        config::THUMBNAIL_SIZE,
+        FilterType::Nearest,
+    );
+    let vis_bytes = visualization::generate_visualization(&gray_thumb, &edge_map);
     let vis_b64 = STANDARD.encode(&vis_bytes);
 
     // --- 5. 组装响应 ---
@@ -421,16 +477,16 @@ pub async fn analyze_frame(
 /// POST /set-region  body: {"region":"lower"}  (lower/upper/left/right)
 /// 下一次分析即生效，无需重启服务。
 pub async fn set_region(
-    State(region): State<Arc<Mutex<HalfRegion>>>,
+    State(state): State<AppState>,
     AxumJson(body): AxumJson<serde_json::Value>,
 ) -> impl IntoResponse {
     let val = body.get("region").and_then(|v| v.as_str()).unwrap_or("lower");
     let new = match val {
-        "upper" => HalfRegion::Upper,
-        "left"  => HalfRegion::Left,
-        "right" => HalfRegion::Right,
-        _       => HalfRegion::Lower,
+        "upper" => config::HalfRegion::Upper,
+        "left"  => config::HalfRegion::Left,
+        "right" => config::HalfRegion::Right,
+        _       => config::HalfRegion::Lower,
     };
-    *region.lock().unwrap() = new;
+    *state.region.lock().unwrap() = new;
     Json(serde_json::json!({"ok": true, "region": val}))
 }
