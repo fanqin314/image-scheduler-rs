@@ -7,8 +7,7 @@ use image::{DynamicImage, GrayImage, ImageBuffer, Rgb};
 use imageproc::contours::find_contours;
 use imageproc::drawing::draw_hollow_rect;
 use imageproc::rect::Rect;
-use crate::config;
-use crate::features; // 用于 segment_foreground 与 sliding_window_features
+use scheduler_core::{config, features}; // features 用于 segment_foreground 与 sliding_window_features
 use std::io::Cursor;
 
 /// 生成可视化标注图（原图灰度 + 边缘 + Otsu分割轮廓 + 峰值窗），返回 JPEG 字节

@@ -1,3 +1,7 @@
+[workspace]
+members = ["scheduler-core"]
+resolver = "2"
+
 [package]
 name = "image-scheduler-rs"
 version = "0.1.0"
@@ -20,3 +24,4 @@ imageproc = "0.23"
 tempfile = "3"
 ffmpeg-sidecar = "1.0"
 rayon = "1"
+scheduler-core = { path = "scheduler-core" }

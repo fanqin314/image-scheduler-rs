@@ -9,17 +9,16 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use image::imageops::FilterType;
-use crate::{
+use scheduler_core::{
     config,
     evaluator,
     features,
     types::{
         AnalyzeFrameRequest, AnalyzeFrameResponse, EvaluationResponse, FeatureMap,
-        FeatureResponse, UploadResponse,
+        FeatureResponse, UploadResponse, VideoFrameResult, VideoSummary, VideoUploadResponse,
     },
-    visualization,
-    AppState,
 };
+use crate::{visualization, AppState};
 use std::io::Cursor;
 
 // ============================================================
@@ -27,13 +26,15 @@ use std::io::Cursor;
 // ============================================================
 
 /// 评估一帧。启用自适应阈值时，顺带把分数喂回窗口以驱动后续校准。
+/// 特征图缺键（内部不一致）时兜底为 LOCAL，不 panic。
 fn evaluate_frame(state: &AppState, feature_map: &FeatureMap) -> EvaluationResponse {
     if !config::ADAPTIVE_THRESHOLD {
-        return evaluator::evaluate(feature_map);
+        return evaluator::evaluate(feature_map).unwrap_or_else(|_| EvaluationResponse::fallback_safe());
     }
     // 同一把锁内完成"取阈值 + 回写分数"，避免并发下的读写撕裂
     let mut th = state.threshold.lock().unwrap();
-    let evaluation = evaluator::evaluate_with_threshold(feature_map, th.threshold());
+    let evaluation = evaluator::evaluate_with_threshold(feature_map, th.threshold())
+        .unwrap_or_else(|_| EvaluationResponse::fallback_safe());
     th.push(evaluation.score);
     evaluation
 }
@@ -124,7 +125,7 @@ pub async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> 
     // --- 9. 构建统一的响应结构 ---
     let response = UploadResponse {
         // 特征响应
-        features: crate::types::FeatureResponse {
+        features: FeatureResponse {
             entropy: feature_map["entropy"],
             edge_ratio: feature_map["edge_ratio"],
             brightness: feature_map["brightness"],
@@ -260,8 +261,9 @@ pub async fn upload_video(State(state): State<AppState>, mut multipart: Multipar
             } else {
                 video_frames.frames[0].1.to_luma8()
             };
-            let feature_map = crate::features::extract_features_with_motion(img, Some(&prev_luma), region);
-            let evaluation = crate::evaluator::evaluate(&feature_map);
+            let feature_map = features::extract_features_with_motion(img, Some(&prev_luma), region);
+            let evaluation = evaluator::evaluate(&feature_map)
+                .unwrap_or_else(|_| EvaluationResponse::fallback_safe());
             let fr = FeatureResponse {
                 entropy: feature_map["entropy"],
                 edge_ratio: feature_map["edge_ratio"],
@@ -287,7 +289,7 @@ pub async fn upload_video(State(state): State<AppState>, mut multipart: Multipar
         .collect();
 
     // Phase 3: 组装最终结果
-    let mut results: Vec<crate::types::VideoFrameResult> = Vec::with_capacity(n);
+    let mut results: Vec<VideoFrameResult> = Vec::with_capacity(n);
     let (mut total_score, mut cloud_count, mut local_count, mut drop_count) = (0.0, 0, 0, 0);
     let (mut max_entropy, mut max_motion) = (0.0, 0.0);
     let mut last_kf_res: Option<(FeatureResponse, EvaluationResponse)> = None;
@@ -336,7 +338,7 @@ pub async fn upload_video(State(state): State<AppState>, mut multipart: Multipar
             if fr.entropy > max_entropy { max_entropy = fr.entropy; }
             if fr.motion > max_motion { max_motion = fr.motion; }
             last_kf_res = Some((fr.clone(), ev.clone()));
-            results.push(crate::types::VideoFrameResult {
+            results.push(VideoFrameResult {
                 frame_index: i,
                 timestamp_secs: *timestamp,
                 is_keyframe: true,
@@ -351,7 +353,7 @@ pub async fn upload_video(State(state): State<AppState>, mut multipart: Multipar
                 "LOCAL" => local_count += 1,
                 _ => drop_count += 1,
             }
-            results.push(crate::types::VideoFrameResult {
+            results.push(VideoFrameResult {
                 frame_index: i,
                 timestamp_secs: *timestamp,
                 is_keyframe: false,
@@ -362,7 +364,7 @@ pub async fn upload_video(State(state): State<AppState>, mut multipart: Multipar
     }
 
     let n = results.len() as f64;
-    let summary = crate::types::VideoSummary {
+    let summary = VideoSummary {
         cloud_count,
         local_count,
         drop_count,
@@ -371,7 +373,7 @@ pub async fn upload_video(State(state): State<AppState>, mut multipart: Multipar
         max_motion,
     };
 
-    let response = crate::types::VideoUploadResponse {
+    let response = VideoUploadResponse {
         total_frames: results.len(),
         fps: video_frames.fps,
         duration_secs: video_frames.total_duration,

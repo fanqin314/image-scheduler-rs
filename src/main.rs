@@ -7,16 +7,14 @@
 //! 输出特征诊断报告与自适应阈值推荐（见 `diagnostics` 模块）。
 
 // ============================================================
-// 模块声明
+// 模块声明（核心算法已抽成独立 crate scheduler-core）
 // ============================================================
-mod config;         // 全局可调参数中心（特征/权重/阈值/采样）
-mod types;          // 公共数据结构
-mod features;       // 特征提取核心（熵、Sobel、滑动窗口、轮廓）
-mod evaluator;      // 价值评估（打分 + 决策 + 滞后防抖）
 mod visualization;  // 可视化标注图生成
 mod handlers;       // Web 路由处理器（首页 / 上传 / 实时分析）
 mod video;          // 视频解码（ffmpeg 逐帧提取）
 mod diagnostics;    // 特征诊断与批量评测（bench 子命令）
+
+use scheduler_core::config; // 特征/权重/阈值参数（含 HalfRegion、DEFAULT_REGION）
 
 // ============================================================
 // 外部依赖导入

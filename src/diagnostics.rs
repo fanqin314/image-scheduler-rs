@@ -10,7 +10,7 @@
 // 本模块就是做这件事所需的量化地基。
 // ============================================================
 
-use crate::{config, evaluator, features, types::FeatureMap};
+use scheduler_core::{config, evaluator, features, types::FeatureMap};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
@@ -320,8 +320,8 @@ pub fn run_bench(paths: &[PathBuf], opts: &BenchOptions) -> anyhow::Result<Bench
         };
 
         let feature_map = features::extract_features(&img, config::DEFAULT_REGION);
-        let breakdown = evaluator::normalize(&feature_map);
-        let evaluation = evaluator::evaluate(&feature_map);
+        let breakdown = evaluator::normalize(&feature_map)?;
+        let evaluation = evaluator::evaluate(&feature_map)?;
 
         files.push(FileResult {
             path: path.clone(),
@@ -608,7 +608,7 @@ pub fn print_report(report: &BenchReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config;
+    use scheduler_core::config;
 
     #[test]
     fn summarize_basic() {

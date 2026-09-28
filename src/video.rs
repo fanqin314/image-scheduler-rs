@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use image::DynamicImage;
 use std::path::Path;
 use tempfile::TempDir;
-use crate::config;
+use scheduler_core::config;
 
 /// 解码后的视频帧集合
 pub struct VideoFrames {
