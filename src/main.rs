@@ -13,6 +13,7 @@ mod visualization;  // 可视化标注图生成
 mod handlers;       // Web 路由处理器（首页 / 上传 / 实时分析）
 mod video;          // 视频解码（ffmpeg 逐帧提取）
 mod diagnostics;    // 特征诊断与批量评测（bench 子命令）
+mod fleet;          // 车组 V2V 可视化面板（阶段1）
 
 use scheduler_core::config; // 特征/权重/阈值参数（含 HalfRegion、DEFAULT_REGION）
 
@@ -41,6 +42,7 @@ use tower_http::trace::TraceLayer; // 日志中间件，自动打印请求日志
 pub struct AppState {
     pub region: Arc<Mutex<config::HalfRegion>>,
     pub threshold: Arc<Mutex<diagnostics::AdaptiveThreshold>>,
+    pub fleet: Option<Arc<fleet::Fleet>>,
 }
 
 // ============================================================
@@ -138,19 +140,30 @@ fn print_usage() {
 // ============================================================
 
 async fn async_main() {
-    // 运行时共享状态：关注的半区方向 + 自适应阈值器
+    // 运行时共享状态：关注的半区方向 + 自适应阈值器 + 车组面板监听节点
+    let fleet = fleet::Fleet::spawn(fleet::HUB_PORT).await;
+    if fleet.is_none() {
+        eprintln!("⚠️ UDP {} 端口被占用，V2V 面板不可用", fleet::HUB_PORT);
+    }
     let state = AppState {
         region: Arc::new(Mutex::new(config::DEFAULT_REGION)),
         threshold: Arc::new(Mutex::new(diagnostics::AdaptiveThreshold::from_config())),
+        fleet,
     };
 
     // Router::new() 创建一个空路由，把 URL 路径和处理器函数绑定
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(handlers::index))
         .route("/upload", post(handlers::upload))
         .route("/upload-video", post(handlers::upload_video))
         .route("/analyze-frame", post(handlers::analyze_frame))
         .route("/set-region", post(handlers::set_region))
+        .route("/v2v", get(fleet::panel_page));
+    // 车队面板 WebSocket：仅在监听节点可用时注册（它需要 fleet state）
+    if state.fleet.is_some() {
+        app = app.route("/ws/v2v", get(fleet::ws_handler));
+    }
+    let app = app
         .with_state(state)
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256MB，匹配前端提示
         .layer(TraceLayer::new_for_http());

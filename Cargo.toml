@@ -1,5 +1,5 @@
 [workspace]
-members = ["scheduler-core"]
+members = ["scheduler-core", "v2v"]
 resolver = "2"
 
 [package]
@@ -10,7 +10,7 @@ edition = "2021"
 [dependencies]
 image = "0.24"
 anyhow = "1.0"
-axum = { version = "0.7", features = ["multipart"] }
+axum = { version = "0.7", features = ["multipart", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["fs", "trace"] }
@@ -25,3 +25,4 @@ tempfile = "3"
 ffmpeg-sidecar = "1.0"
 rayon = "1"
 scheduler-core = { path = "scheduler-core" }
+v2v = { path = "v2v" }
